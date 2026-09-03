@@ -30,7 +30,35 @@ require_bazel() {
     echo "bazel not found on PATH. See README.md for installation." >&2
     exit 1
   fi
-  log "bazel $(bazel --version 2>/dev/null | head -1)"
+  log "$(bazel --version 2>/dev/null | head -1)"
+}
+
+# Bazel resolves @local_jdk from JAVA_HOME. A version-manager shim on PATH is
+# not enough: without a real JDK directory the build fails during analysis with
+# "no such target '@@rules_java~~toolchains~local_jdk//:bin/java'", which does
+# not mention Java at all.
+require_jdk() {
+  if [[ -n "${JAVA_HOME:-}" && -x "${JAVA_HOME}/bin/javac" ]]; then
+    log "JAVA_HOME=$JAVA_HOME"
+    return
+  fi
+  local candidate
+  # macOS system locator first, then the newest asdf-installed JDK.
+  if candidate="$(/usr/libexec/java_home 2>/dev/null)" && [[ -x "$candidate/bin/javac" ]]; then
+    export JAVA_HOME="$candidate"
+  else
+    candidate="$(find "$HOME/.asdf/installs/java" -maxdepth 1 -mindepth 1 -type d 2>/dev/null \
+                 | sort -V | tail -1)"
+    if [[ -n "$candidate" && -x "$candidate/bin/javac" ]]; then
+      export JAVA_HOME="$candidate"
+    fi
+  fi
+  if [[ -z "${JAVA_HOME:-}" ]]; then
+    echo "No JDK found. Bazel needs JAVA_HOME to point at a real JDK." >&2
+    echo "Install one (e.g. 'asdf install java zulu-21.42.19') and re-run." >&2
+    exit 1
+  fi
+  log "JAVA_HOME=$JAVA_HOME (auto-detected)"
 }
 
 build_all() {
@@ -51,6 +79,7 @@ run_all_tests() {
 }
 
 require_bazel
+require_jdk
 
 case "$MODE" in
   build)

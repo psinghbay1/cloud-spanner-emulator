@@ -125,6 +125,7 @@ class Database {
   // Counts returned by ReclaimStorage().
   struct ReclaimStats {
     int64_t rows_purged = 0;
+    int64_t versions_purged = 0;
   };
 
   // Reclaims storage held by deleted rows, dropped tables and dropped columns,

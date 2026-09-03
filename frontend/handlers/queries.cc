@@ -266,11 +266,17 @@ absl::Status HandleEmulatorReclaim(std::shared_ptr<Session> session,
                    session->database()->ReclaimStorage(
                        ParseReclaimTableNames(sql)));
 
-  auto* field = response->mutable_metadata()->mutable_row_type()->add_fields();
-  field->set_name("rows_purged");
-  field->mutable_type()->set_code(google::spanner::v1::TypeCode::INT64);
-  response->add_rows()->add_values()->set_string_value(
-      absl::StrCat(stats.rows_purged));
+  auto* row_type = response->mutable_metadata()->mutable_row_type();
+  auto* rows_field = row_type->add_fields();
+  rows_field->set_name("rows_purged");
+  rows_field->mutable_type()->set_code(google::spanner::v1::TypeCode::INT64);
+  auto* versions_field = row_type->add_fields();
+  versions_field->set_name("versions_purged");
+  versions_field->mutable_type()->set_code(google::spanner::v1::TypeCode::INT64);
+
+  auto* row = response->add_rows();
+  row->add_values()->set_string_value(absl::StrCat(stats.rows_purged));
+  row->add_values()->set_string_value(absl::StrCat(stats.versions_purged));
   return absl::OkStatus();
 }
 

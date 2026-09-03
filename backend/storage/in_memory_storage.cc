@@ -300,6 +300,58 @@ void InMemoryStorage::CleanUpDeletedColumns(absl::Time timestamp) {
   }
 }
 
+int64_t InMemoryStorage::PurgeExpiredVersions(
+    absl::Time timestamp, const std::vector<TableID>& table_ids) {
+  absl::MutexLock lock(mu_);
+  absl::Time expiration_time;
+  {
+    absl::MutexLock retention_lock(version_retention_period_mu_);
+    expiration_time = timestamp - version_retention_period_;
+  }
+
+  // RemoveExpiredVersions() only runs while its own cell is being written, so
+  // a row that is updated a few times and then left alone keeps every
+  // superseded version for the lifetime of the process. Sweep them here.
+  //
+  // The newest version at or before the retention floor is kept, so a read
+  // anywhere inside the retention window still resolves correctly. This is the
+  // same rule RemoveExpiredVersions() applies.
+  int64_t erased = 0;
+  auto purge_cell = [&](Cell& cell) {
+    auto upper_bound = cell.upper_bound(expiration_time);
+    for (auto it = cell.begin(); it != upper_bound;) {
+      auto next = it;
+      if (++next == upper_bound) {
+        break;  // Keep the version covering the retention period.
+      }
+      it = cell.erase(it);
+      ++erased;
+    }
+  };
+
+  auto purge_table = [&](Table& table) {
+    for (auto& [_, row] : table) {
+      for (auto& [_column_id, cell] : row) {
+        purge_cell(cell);
+      }
+    }
+  };
+
+  if (table_ids.empty()) {
+    for (auto& [_, table] : tables_) {
+      purge_table(table);
+    }
+  } else {
+    for (const TableID& table_id : table_ids) {
+      auto table_itr = tables_.find(table_id);
+      if (table_itr != tables_.end()) {
+        purge_table(table_itr->second);
+      }
+    }
+  }
+  return erased;
+}
+
 int64_t InMemoryStorage::PurgeExpiredDeletedRows(
     absl::Time timestamp, const std::vector<TableID>& table_ids) {
   absl::MutexLock lock(mu_);

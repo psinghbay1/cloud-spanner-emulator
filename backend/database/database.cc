@@ -248,6 +248,7 @@ absl::StatusOr<Database::ReclaimStats> Database::ReclaimStorage(
 
   ReclaimStats stats;
   stats.rows_purged = storage_->PurgeExpiredDeletedRows(now, table_ids);
+  stats.versions_purged = storage_->PurgeExpiredVersions(now, table_ids);
 
   // Dropped tables and columns are otherwise reclaimed only on a schema change
   // or a read-only transaction, so an idle database never runs them. Both are

@@ -946,10 +946,66 @@ TEST_F(InMemoryStorageTest, PurgeIsIdempotent) {
   EXPECT_EQ(storage_.PurgeExpiredDeletedRows(now, {}), 0);
 }
 
+// PurgeExpiredVersions covers the other half of the waste: a LIVE row that was
+// updated a few times and then left alone. RemoveExpiredVersions() only runs
+// while its own cell is being written, so those superseded versions are never
+// reclaimed on their own.
+TEST_F(InMemoryStorageTest, PurgeVersionsTrimsSupersededVersionsOfLiveRow) {
+  storage_.SetVersionRetentionPeriod(absl::Seconds(1));
+  absl::Time now = absl::Now();
+
+  // Five writes to one cell, all well outside the retention window.
+  for (int i = 10; i >= 6; --i) {
+    GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(i), kTableId0,
+                             Key({Int64(1)}), {kColumnID}, {Int64(i)}));
+  }
+
+  // Four of the five versions are erased; the newest before the retention
+  // floor is kept so reads inside the window still resolve.
+  EXPECT_EQ(storage_.PurgeExpiredVersions(now, {}), 4);
+
+  std::vector<googlesql::Value> values;
+  GOOGLESQL_EXPECT_OK(
+      storage_.Lookup(now, kTableId0, Key({Int64(1)}), {kColumnID}, &values));
+  EXPECT_THAT(values, testing::ElementsAre(Int64(6)));
+}
+
+TEST_F(InMemoryStorageTest, PurgeVersionsKeepsVersionsInsideRetentionWindow) {
+  storage_.SetVersionRetentionPeriod(absl::Hours(1));
+  absl::Time now = absl::Now();
+
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(30), kTableId0,
+                           Key({Int64(1)}), {kColumnID}, {Int64(1)}));
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(20), kTableId0,
+                           Key({Int64(1)}), {kColumnID}, {Int64(2)}));
+
+  // Both versions are readable inside the window, so neither may be erased.
+  EXPECT_EQ(storage_.PurgeExpiredVersions(now, {}), 0);
+
+  std::vector<googlesql::Value> values;
+  GOOGLESQL_EXPECT_OK(storage_.Lookup(now - absl::Minutes(25), kTableId0, Key({Int64(1)}),
+                            {kColumnID}, &values));
+  EXPECT_THAT(values, testing::ElementsAre(Int64(1)));
+}
+
+TEST_F(InMemoryStorageTest, PurgeVersionsIsIdempotent) {
+  storage_.SetVersionRetentionPeriod(absl::Seconds(1));
+  absl::Time now = absl::Now();
+
+  for (int i = 10; i >= 8; --i) {
+    GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(i), kTableId0,
+                             Key({Int64(1)}), {kColumnID}, {Int64(i)}));
+  }
+
+  EXPECT_EQ(storage_.PurgeExpiredVersions(now, {}), 2);
+  EXPECT_EQ(storage_.PurgeExpiredVersions(now, {}), 0);
+}
+
 TEST_F(InMemoryStorageTest, PurgeOnUnknownTableIsNoOp) {
   absl::Time now = absl::Now();
   EXPECT_EQ(storage_.PurgeExpiredDeletedRows(now, {"no_such_table"}), 0);
   EXPECT_EQ(storage_.PurgeExpiredDeletedRows(now, {}), 0);
+  EXPECT_EQ(storage_.PurgeExpiredVersions(now, {"no_such_table"}), 0);
 }
 
 TEST_F(InMemoryStorageTest, PurgeRemovesOnlyExpiredRowsFromMixedTable) {

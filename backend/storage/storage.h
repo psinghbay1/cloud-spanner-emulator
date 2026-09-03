@@ -108,6 +108,22 @@ class Storage {
   // the number of row keys erased.
   virtual int64_t PurgeExpiredDeletedRows(
       absl::Time timestamp, const std::vector<TableID>& table_ids) = 0;
+
+  // Erases superseded versions of LIVE rows that are older than the version
+  // retention period.
+  //
+  // RemoveExpiredVersions() only runs while its own cell is being written, so a
+  // row that is updated a few times and then left alone keeps every superseded
+  // version for the lifetime of the process. This sweeps them without needing a
+  // write to each cell.
+  //
+  // The newest version at or before the retention floor is kept, so reads
+  // anywhere inside the retention window still resolve correctly.
+  //
+  // `table_ids` scopes the sweep; an empty vector sweeps every table. Returns
+  // the number of versions erased.
+  virtual int64_t PurgeExpiredVersions(
+      absl::Time timestamp, const std::vector<TableID>& table_ids) = 0;
 };
 
 }  // namespace backend

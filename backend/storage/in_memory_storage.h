@@ -87,6 +87,10 @@ class InMemoryStorage : public Storage {
                                   const std::vector<TableID>& table_ids)
       override ABSL_LOCKS_EXCLUDED(mu_);
 
+  int64_t PurgeExpiredVersions(absl::Time timestamp,
+                               const std::vector<TableID>& table_ids) override
+      ABSL_LOCKS_EXCLUDED(mu_);
+
  private:
   using Cell = std::map<absl::Time, googlesql::Value>;
   using Row = absl::flat_hash_map<ColumnID, Cell>;
