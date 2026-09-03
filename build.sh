@@ -6,6 +6,9 @@
 #   ./build.sh test         # tests only (assumes a prior build)
 #   ./build.sh all-tests    # the full upstream test suite (slow: 30-60+ min)
 #
+# Run ./setup.sh first if this is a fresh machine -- it checks bazel, the JDK,
+# and Docker build-network DNS.
+#
 # Requires bazel (see README.md for the supported version) and a C++ toolchain.
 # The first build compiles GoogleSQL and PostgreSQL sources and can take well
 # over an hour; later builds are incremental.
@@ -55,7 +58,8 @@ require_jdk() {
   fi
   if [[ -z "${JAVA_HOME:-}" ]]; then
     echo "No JDK found. Bazel needs JAVA_HOME to point at a real JDK." >&2
-    echo "Install one (e.g. 'asdf install java zulu-21.42.19') and re-run." >&2
+    echo "Run ./setup.sh to diagnose, or install one:" >&2
+    echo "  asdf install java zulu-21.42.19" >&2
     exit 1
   fi
   log "JAVA_HOME=$JAVA_HOME (auto-detected)"

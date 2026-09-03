@@ -36,6 +36,34 @@ done
 
 log() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
+# Bazel fetches Go dependencies during the build, so the BUILD network must be
+# able to resolve names. That is a different network from `docker run`, and on a
+# host whose resolver is IPv6-only the build layers cannot reach it: every fetch
+# fails with "no such host" roughly 20 minutes in. Fail fast instead, and point
+# at setup.sh, which fixes it once for the machine.
+check_build_dns() {
+  log "Checking DNS inside the Docker build network"
+  if printf 'FROM ubuntu:22.04\nRUN getent hosts storage.googleapis.com\n' \
+       | docker build --no-cache -q - > /dev/null 2>&1; then
+    echo "  OK"
+    return
+  fi
+  cat >&2 <<'EOM'
+
+ERROR: DNS does not resolve inside the Docker build network, so Bazel cannot
+fetch its Go dependencies. This is a host configuration issue, not a problem
+with this branch.
+
+Run the one-time host setup, then restart Docker Desktop:
+
+  ./setup.sh
+
+EOM
+  exit 1
+}
+
+check_build_dns
+
 log "Building $IMAGE_TAG (this takes a while on a cold cache)"
 docker build . -t "$IMAGE_TAG" -f build/docker/Dockerfile.ubuntu
 

@@ -81,6 +81,7 @@ storage in the background. Do not write production code against it.
 ## Build and verify
 
 ```bash
+./setup.sh                 # one-time host setup: bazel, JDK, Docker build DNS
 ./build.sh                 # build //... then run the reclamation tests
 ./build.sh test            # tests only
 ./build.sh all-tests       # full upstream suite (slow)
@@ -88,6 +89,11 @@ storage in the background. Do not write production code against it.
 ./build_docker.sh          # build spanner-emulator-fork:latest
 ./build_docker.sh --verify # build, then prove RSS actually drops
 ```
+
+Run `./setup.sh` first on a fresh machine. It checks the three things that
+otherwise fail confusingly deep into a build: bazel, a real JDK for `JAVA_HOME`
+(a version-manager shim is not enough), and DNS inside the Docker *build*
+network, which differs from `docker run` and is broken on IPv6-only hosts.
 
 `--verify` matters: a unit test cannot see problem 2. `verify_reclaim.py`
 writes 20k rows, deletes them, calls `EMULATOR_RECLAIM`, and compares container
