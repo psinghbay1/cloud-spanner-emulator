@@ -215,16 +215,24 @@ def main():
         record("4. DROP DATABASE", before, rss(CONTAINER))
 
         # --- 6. DROP INDEX x142 (before deleting the instance) -------------
-        # One column per index: repeating (table, column) pairs is rejected.
-        statements = ["CREATE TABLE W (id INT64 NOT NULL, "
-                      + ", ".join(f"c{i} STRING(MAX)" for i in range(142)) + ") PRIMARY KEY (id)"]
-        statements += [f"CREATE INDEX ix{i} ON W(c{i})" for i in range(142)]
+        # 142 indexes, split across two tables: Spanner caps a table at 128
+        # indexes, and repeating a (table, column) pair is rejected, so each
+        # index gets its own column.
+        statements = []
+        for table, count in (("W1", 100), ("W2", 42)):
+            columns = ", ".join(f"c{i} STRING(MAX)" for i in range(count))
+            statements.append(
+                f"CREATE TABLE {table} (id INT64 NOT NULL, {columns}) PRIMARY KEY (id)")
+        statements += [f"CREATE INDEX ixa{i} ON W1(c{i})" for i in range(100)]
+        statements += [f"CREATE INDEX ixb{i} ON W2(c{i})" for i in range(42)]
         emulator.create_database("benchidx", statements)
         emulator.ddl("benchidx", [
             f"ALTER DATABASE benchidx SET OPTIONS (version_retention_period = '{args.retention}')"])
         session4 = emulator.session("benchidx")
         before = rss(CONTAINER)
-        emulator.ddl("benchidx", [f"DROP INDEX ix{i}" for i in range(142)])
+        emulator.ddl("benchidx",
+                     [f"DROP INDEX ixa{i}" for i in range(100)]
+                     + [f"DROP INDEX ixb{i}" for i in range(42)])
         time.sleep(4)
         note = ""
         if args.reclaim:

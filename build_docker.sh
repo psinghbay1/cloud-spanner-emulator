@@ -6,6 +6,8 @@
 #   ./build_docker.sh                    # build spanner-emulator-fork:latest
 #   ./build_docker.sh --tag my:tag       # build with a custom tag
 #   ./build_docker.sh --verify           # build, then run a reclamation smoke test
+#   ./build_docker.sh --low-memory       # aggressive GCC GC; use if the build OOMs
+#   ./build_docker.sh --jobs 4           # cap bazel parallelism by hand
 #
 # The build compiles the emulator from source inside the container and takes a
 # long time on a cold cache (typically 45-90 min). Docker layer caching makes
@@ -24,11 +26,13 @@ cd "$SCRIPT_DIR"
 
 IMAGE_TAG="spanner-emulator-fork:latest"
 VERIFY=false
+LOW_MEMORY=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tag) IMAGE_TAG="$2"; shift 2 ;;
     --jobs) BAZEL_JOBS="$2"; shift 2 ;;
+    --low-memory) LOW_MEMORY=true; shift ;;
     --verify) VERIFY=true; shift ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 1 ;;
@@ -83,10 +87,15 @@ compute_bazel_jobs() {
     log "Could not read Docker VM resources; leaving bazel parallelism at default"
     return
   fi
-  by_mem=$(( mem_bytes / (2 * 1024 * 1024 * 1024) ))
+  # GoogleSQL's tm_parser.cc is a bison-generated file whose single cc1plus
+  # process peaks at roughly 8-10 GB. Budgeting one job per 2 GB is not enough:
+  # at --jobs=15 on a 31 GiB VM the build still died on that file, because the
+  # other 15 jobs had already claimed the memory it needed. Budget 4 GB per job
+  # so the peak file has room even when the rest of the build is saturated.
+  by_mem=$(( mem_bytes / (4 * 1024 * 1024 * 1024) ))
   (( by_mem < 1 )) && by_mem=1
   BAZEL_JOBS=$(( by_mem < cpus ? by_mem : cpus ))
-  log "Docker VM: $((mem_bytes / 1024 / 1024 / 1024)) GiB / ${cpus} CPUs -> --jobs=$BAZEL_JOBS"
+  log "Docker VM: $((mem_bytes / 1024 / 1024 / 1024)) GiB / ${cpus} CPUs -> --jobs=$BAZEL_JOBS (4 GB/job)"
   if (( BAZEL_JOBS < 4 )); then
     echo "  NOTE: this is low and the build will be slow. Raise Docker Desktop's"
     echo "        memory limit (Settings > Resources) for a faster build."
@@ -97,6 +106,15 @@ compute_bazel_jobs
 
 BUILD_ARGS=()
 [[ -n "${BAZEL_JOBS:-}" ]] && BUILD_ARGS+=(--build-arg "BAZEL_JOBS=$BAZEL_JOBS")
+
+# --low-memory makes GCC collect far more aggressively while compiling. Peak RSS
+# on the heavy generated files drops noticeably at maybe 10-20% more compile
+# time, and unlike lowering -O it does not change the generated code.
+if [[ "$LOW_MEMORY" == true ]]; then
+  GCC_MEMORY_COPTS="--copt=--param=ggc-min-expand=10 --copt=--param=ggc-min-heapsize=32768 --copt=-fno-var-tracking --copt=-fno-var-tracking-assignments"
+  log "Low-memory mode: aggressive GCC garbage collection"
+  BUILD_ARGS+=(--build-arg "GCC_MEMORY_COPTS=$GCC_MEMORY_COPTS")
+fi
 
 log "Building $IMAGE_TAG (this takes a while on a cold cache)"
 docker build "${BUILD_ARGS[@]}" . -t "$IMAGE_TAG" -f build/docker/Dockerfile.ubuntu

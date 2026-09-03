@@ -78,7 +78,21 @@ COPY MODULE.bazel MODULE.bazel.lock* .bazelversion .bazelrc BUILD.bazel \
 # BAZEL_JOBS caps it. Leave empty to keep upstream behaviour.
 ARG BAZEL_JOBS=""
 ENV BAZEL_JOBS_ARG=${BAZEL_JOBS:+--jobs=${BAZEL_JOBS}}
-RUN bazel build -c opt ${BAZEL_JOBS_ARG} \
+
+# GoogleSQL's tm_parser.cc is a bison-generated parser compiled as one
+# translation unit; at -O2 a single cc1plus peaks around 8-10 GB and is
+# OOM-killed on a modest VM. GCC_MEMORY_COPTS makes GCC's garbage collector run
+# far more aggressively, which cuts peak RSS without changing generated code
+# (unlike lowering -O, which would).
+#
+#   ggc-min-expand=10    collect once the heap grows 10% (default scales to 100%)
+#   ggc-min-heapsize     start collecting from 32 MB rather than much later
+#   -fno-var-tracking*   skip costly debug-location tracking (-g0 is set anyway)
+#
+# Empty by default so upstream behaviour is unchanged.
+ARG GCC_MEMORY_COPTS=""
+ENV GCC_MEMORY_ARGS=${GCC_MEMORY_COPTS:+${GCC_MEMORY_COPTS}}
+RUN bazel build -c opt ${BAZEL_JOBS_ARG} ${GCC_MEMORY_ARGS} \
     @com_google_googlesql//googlesql/public:value \
     @com_google_googlesql//googlesql/public:analyzer
 
@@ -92,7 +106,7 @@ RUN find third_party/spanner_pg -name "nodes.h" -exec sed -i 's/enum NodeTag : i
 # Since we are only copying the binaries to the release image, we don't need to
 # build the rest of the targets.
 ENV EXTRA_BAZEL_ARGS="--tool_java_runtime_version=local_jdk"
-RUN bazel build -c opt ${BAZEL_JOBS_ARG} \
+RUN bazel build -c opt ${BAZEL_JOBS_ARG} ${GCC_MEMORY_ARGS} \
     //binaries:emulator_main \
     //binaries:gateway_main
 
