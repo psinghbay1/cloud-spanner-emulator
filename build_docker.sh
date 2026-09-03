@@ -6,8 +6,12 @@
 #   ./build_docker.sh                    # build spanner-emulator-fork:latest
 #   ./build_docker.sh --tag my:tag       # build with a custom tag
 #   ./build_docker.sh --verify           # build, then run a reclamation smoke test
-#   ./build_docker.sh --low-memory       # aggressive GCC GC; use if the build OOMs
+#   ./build_docker.sh --no-low-memory    # opt OUT of the aggressive GCC GC
 #   ./build_docker.sh --jobs 4           # cap bazel parallelism by hand
+#
+# Low-memory mode is ON by default: it cuts GCC's peak RSS on the heavy
+# generated files and does not change the generated code, so there is little
+# reason to turn it off.
 #
 # The build compiles the emulator from source inside the container and takes a
 # long time on a cold cache (typically 45-90 min). Docker layer caching makes
@@ -26,13 +30,14 @@ cd "$SCRIPT_DIR"
 
 IMAGE_TAG="spanner-emulator-fork:latest"
 VERIFY=false
-LOW_MEMORY=false
+LOW_MEMORY=true
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tag) IMAGE_TAG="$2"; shift 2 ;;
     --jobs) BAZEL_JOBS="$2"; shift 2 ;;
     --low-memory) LOW_MEMORY=true; shift ;;
+    --no-low-memory) LOW_MEMORY=false; shift ;;
     --verify) VERIFY=true; shift ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 1 ;;
@@ -107,9 +112,10 @@ compute_bazel_jobs
 BUILD_ARGS=()
 [[ -n "${BAZEL_JOBS:-}" ]] && BUILD_ARGS+=(--build-arg "BAZEL_JOBS=$BAZEL_JOBS")
 
-# --low-memory makes GCC collect far more aggressively while compiling. Peak RSS
-# on the heavy generated files drops noticeably at maybe 10-20% more compile
-# time, and unlike lowering -O it does not change the generated code.
+# On by default: GCC collects far more aggressively while compiling, so peak RSS
+# on the heavy generated files drops at maybe 10-20% more compile time. Unlike
+# lowering -O this does not change the generated code, so it is safe to leave on.
+# Disable with --no-low-memory.
 if [[ "$LOW_MEMORY" == true ]]; then
   GCC_MEMORY_COPTS="--copt=--param=ggc-min-expand=10 --copt=--param=ggc-min-heapsize=32768 --copt=-fno-var-tracking --copt=-fno-var-tracking-assignments"
   log "Low-memory mode: aggressive GCC garbage collection"
