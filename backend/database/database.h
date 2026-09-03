@@ -122,6 +122,25 @@ class Database {
 
   PgOidAssigner* get_pg_oid_assigner() { return pg_oid_assigner_.get(); }
 
+  // Counts returned by ReclaimStorage().
+  struct ReclaimStats {
+    int64_t rows_purged = 0;
+  };
+
+  // Reclaims storage held by deleted rows, dropped tables and dropped columns,
+  // then asks the allocator to return free pages to the OS.
+  //
+  // EMULATOR ONLY. Cloud Spanner has no equivalent API; it reclaims storage in
+  // the background. The emulator does not, so a long-lived container otherwise
+  // grows for its whole lifetime. Intended for local test harnesses that want
+  // to reclaim between test batches instead of restarting the container.
+  //
+  // `table_names` scopes the sweep to those tables; an empty vector sweeps the
+  // whole database. Unknown names are ignored rather than rejected, so a caller
+  // sweeping a fixed list need not track schema changes. Idempotent.
+  absl::StatusOr<ReclaimStats> ReclaimStorage(
+      const std::vector<std::string>& table_names);
+
  private:
   Database();
   // Delete copy and assignment operators since database shouldn't be copyable.

@@ -17,6 +17,9 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_STORAGE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_STORAGE_H_
 
+#include <cstdint>
+#include <vector>
+
 #include "googlesql/public/value.h"
 #include "absl/status/status.h"
 #include "absl/time/time.h"
@@ -87,6 +90,24 @@ class Storage {
 
   virtual void MarkDroppedColumn(absl::Time timestamp, TableID dropped_table_id,
                                  ColumnID dropped_column_id) = 0;
+
+  // Erases rows whose latest version is a deletion marker older than the
+  // version retention period, including the row key itself.
+  //
+  // Delete() only appends a tombstone; the row key is never removed, and
+  // RemoveExpiredVersions() can only trim a cell that is being written again.
+  // A row that is deleted and never touched again therefore occupies memory
+  // for the lifetime of the process. This reclaims those rows.
+  //
+  // A row is only erased when it is invisible at every timestamp a transaction
+  // may legally read, i.e. its deletion marker is older than
+  // `timestamp - version_retention_period`, using the same arithmetic as
+  // CleanUpDeletedTables().
+  //
+  // `table_ids` scopes the sweep; an empty vector sweeps every table. Returns
+  // the number of row keys erased.
+  virtual int64_t PurgeExpiredDeletedRows(
+      absl::Time timestamp, const std::vector<TableID>& table_ids) = 0;
 };
 
 }  // namespace backend

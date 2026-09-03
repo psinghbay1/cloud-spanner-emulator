@@ -826,6 +826,153 @@ TEST_F(InMemoryStorageTest, RemoveExpiredVersionsFromCellOnDelete) {
   EXPECT_THAT(values, testing::ElementsAre(googlesql::Value()));
 }
 
+// Tests for PurgeExpiredDeletedRows.
+//
+// Delete() only appends a tombstone, so a deleted row keeps its key and cells
+// for the lifetime of the process. PurgeExpiredDeletedRows erases rows whose
+// deletion marker is older than the version retention period, i.e. rows that
+// are invisible at every timestamp a transaction may legally read.
+//
+// The retention period is set short so the tests do not have to sleep; the
+// timestamps are constructed relative to now.
+
+TEST_F(InMemoryStorageTest, PurgeRemovesRowDeletedBeforeRetentionWindow) {
+  storage_.SetVersionRetentionPeriod(absl::Seconds(1));
+  absl::Time now = absl::Now();
+  absl::Time write_ts = now - absl::Minutes(10);
+  absl::Time delete_ts = now - absl::Minutes(5);
+
+  GOOGLESQL_EXPECT_OK(storage_.Write(write_ts, kTableId0, Key({Int64(1)}), {kColumnID},
+                           {Bool(true)}));
+  GOOGLESQL_EXPECT_OK(
+      storage_.Delete(delete_ts, kTableId0, KeyRange::Point(Key({Int64(1)}))));
+
+  EXPECT_EQ(storage_.PurgeExpiredDeletedRows(now, {}), 1);
+
+  // The row is gone entirely, so a read at any timestamp finds nothing.
+  GOOGLESQL_EXPECT_OK(storage_.Read(now, kTableId0, kKeyRange0To5, {kColumnID}, &itr_));
+  EXPECT_FALSE(itr_->Next());
+}
+
+TEST_F(InMemoryStorageTest, PurgeKeepsLiveRow) {
+  storage_.SetVersionRetentionPeriod(absl::Seconds(1));
+  absl::Time now = absl::Now();
+
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(10), kTableId0,
+                           Key({Int64(1)}), {kColumnID}, {Bool(true)}));
+
+  EXPECT_EQ(storage_.PurgeExpiredDeletedRows(now, {}), 0);
+
+  std::vector<googlesql::Value> values;
+  GOOGLESQL_EXPECT_OK(
+      storage_.Lookup(now, kTableId0, Key({Int64(1)}), {kColumnID}, &values));
+  EXPECT_THAT(values, testing::ElementsAre(Bool(true)));
+}
+
+// The safety property that matters: a row deleted inside the retention window
+// is still readable at an earlier timestamp, so it must not be erased.
+TEST_F(InMemoryStorageTest, PurgeKeepsRowDeletedInsideRetentionWindow) {
+  storage_.SetVersionRetentionPeriod(absl::Hours(1));
+  absl::Time now = absl::Now();
+  absl::Time write_ts = now - absl::Minutes(30);
+  absl::Time delete_ts = now - absl::Minutes(10);
+
+  GOOGLESQL_EXPECT_OK(storage_.Write(write_ts, kTableId0, Key({Int64(1)}), {kColumnID},
+                           {Bool(true)}));
+  GOOGLESQL_EXPECT_OK(
+      storage_.Delete(delete_ts, kTableId0, KeyRange::Point(Key({Int64(1)}))));
+
+  EXPECT_EQ(storage_.PurgeExpiredDeletedRows(now, {}), 0);
+
+  // A stale read between the write and the delete still sees the row.
+  std::vector<googlesql::Value> values;
+  GOOGLESQL_EXPECT_OK(storage_.Lookup(now - absl::Minutes(20), kTableId0, Key({Int64(1)}),
+                            {kColumnID}, &values));
+  EXPECT_THAT(values, testing::ElementsAre(Bool(true)));
+}
+
+// A row deleted and then re-inserted is live and must survive.
+TEST_F(InMemoryStorageTest, PurgeKeepsResurrectedRow) {
+  storage_.SetVersionRetentionPeriod(absl::Seconds(1));
+  absl::Time now = absl::Now();
+
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(10), kTableId0,
+                           Key({Int64(1)}), {kColumnID}, {Bool(true)}));
+  GOOGLESQL_EXPECT_OK(storage_.Delete(now - absl::Minutes(8), kTableId0,
+                            KeyRange::Point(Key({Int64(1)}))));
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(6), kTableId0, Key({Int64(1)}),
+                           {kColumnID}, {Bool(false)}));
+
+  EXPECT_EQ(storage_.PurgeExpiredDeletedRows(now, {}), 0);
+
+  std::vector<googlesql::Value> values;
+  GOOGLESQL_EXPECT_OK(
+      storage_.Lookup(now, kTableId0, Key({Int64(1)}), {kColumnID}, &values));
+  EXPECT_THAT(values, testing::ElementsAre(Bool(false)));
+}
+
+TEST_F(InMemoryStorageTest, PurgeScopedToNamedTablesOnly) {
+  storage_.SetVersionRetentionPeriod(absl::Seconds(1));
+  absl::Time now = absl::Now();
+  absl::Time write_ts = now - absl::Minutes(10);
+  absl::Time delete_ts = now - absl::Minutes(5);
+
+  for (const TableID& table_id : {kTableId0, kTableId1}) {
+    GOOGLESQL_EXPECT_OK(storage_.Write(write_ts, table_id, Key({Int64(1)}), {kColumnID},
+                             {Bool(true)}));
+    GOOGLESQL_EXPECT_OK(
+        storage_.Delete(delete_ts, table_id, KeyRange::Point(Key({Int64(1)}))));
+  }
+
+  // Only table 0 is swept.
+  EXPECT_EQ(storage_.PurgeExpiredDeletedRows(now, {kTableId0}), 1);
+  GOOGLESQL_EXPECT_OK(storage_.Read(now, kTableId0, kKeyRange0To5, {kColumnID}, &itr_));
+  EXPECT_FALSE(itr_->Next());
+
+  // Table 1 still holds its tombstoned row, and a later sweep reclaims it.
+  EXPECT_EQ(storage_.PurgeExpiredDeletedRows(now, {kTableId1}), 1);
+}
+
+TEST_F(InMemoryStorageTest, PurgeIsIdempotent) {
+  storage_.SetVersionRetentionPeriod(absl::Seconds(1));
+  absl::Time now = absl::Now();
+
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(10), kTableId0,
+                           Key({Int64(1)}), {kColumnID}, {Bool(true)}));
+  GOOGLESQL_EXPECT_OK(storage_.Delete(now - absl::Minutes(5), kTableId0,
+                            KeyRange::Point(Key({Int64(1)}))));
+
+  EXPECT_EQ(storage_.PurgeExpiredDeletedRows(now, {}), 1);
+  EXPECT_EQ(storage_.PurgeExpiredDeletedRows(now, {}), 0);
+}
+
+TEST_F(InMemoryStorageTest, PurgeOnUnknownTableIsNoOp) {
+  absl::Time now = absl::Now();
+  EXPECT_EQ(storage_.PurgeExpiredDeletedRows(now, {"no_such_table"}), 0);
+  EXPECT_EQ(storage_.PurgeExpiredDeletedRows(now, {}), 0);
+}
+
+TEST_F(InMemoryStorageTest, PurgeRemovesOnlyExpiredRowsFromMixedTable) {
+  storage_.SetVersionRetentionPeriod(absl::Seconds(1));
+  absl::Time now = absl::Now();
+
+  // Row 1: deleted long ago -> purgeable.
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(10), kTableId0,
+                           Key({Int64(1)}), {kColumnID}, {Bool(true)}));
+  GOOGLESQL_EXPECT_OK(storage_.Delete(now - absl::Minutes(5), kTableId0,
+                            KeyRange::Point(Key({Int64(1)}))));
+  // Row 2: still live -> must survive.
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(10), kTableId0,
+                           Key({Int64(2)}), {kColumnID}, {Bool(true)}));
+
+  EXPECT_EQ(storage_.PurgeExpiredDeletedRows(now, {}), 1);
+
+  GOOGLESQL_EXPECT_OK(storage_.Read(now, kTableId0, kKeyRange0To5, {kColumnID}, &itr_));
+  ASSERT_TRUE(itr_->Next());
+  EXPECT_EQ(itr_->Key(), Key({Int64(2)}));
+  EXPECT_FALSE(itr_->Next());
+}
+
 }  // namespace
 
 }  // namespace backend

@@ -16,9 +16,16 @@
 
 #include "backend/database/database.h"
 
+#include <cstdint>
 #include <memory>
+#include <string>
 #include <thread>  // NOLINT
 #include <utility>
+#include <vector>
+
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 #include "google/spanner/admin/database/v1/common.pb.h"
 #include "googlesql/public/types/type_factory.h"
@@ -36,8 +43,10 @@
 #include "backend/database/pg_oid_assigner/pg_oid_assigner.h"
 #include "backend/locking/manager.h"
 #include "backend/query/query_engine.h"
+#include "backend/schema/catalog/index.h"
 #include "backend/schema/catalog/proto_bundle.h"
 #include "backend/schema/catalog/schema.h"
+#include "backend/schema/catalog/table.h"
 #include "backend/schema/catalog/versioned_catalog.h"
 #include "backend/schema/graph/schema_graph.h"
 #include "backend/schema/updater/schema_updater.h"
@@ -212,6 +221,48 @@ absl::Status Database::UpdateSchema(
 
 const Schema* Database::GetLatestSchema() const {
   return versioned_catalog_->GetLatestSchema();
+}
+
+absl::StatusOr<Database::ReclaimStats> Database::ReclaimStorage(
+    const std::vector<std::string>& table_names) {
+  const absl::Time now = clock_->Now();
+
+  // Resolve names to storage TableIDs. An index keeps its rows in its own data
+  // table, so sweeping a table also sweeps the indexes defined on it.
+  std::vector<TableID> table_ids;
+  const Schema* schema = versioned_catalog_->GetLatestSchema();
+  for (const std::string& table_name : table_names) {
+    const Table* table = schema->FindTable(table_name);
+    if (table == nullptr) {
+      // Ignored rather than rejected: a harness sweeping a fixed list should
+      // not break when a table is renamed or dropped.
+      continue;
+    }
+    table_ids.push_back(table->id());
+    for (const Index* index : table->indexes()) {
+      if (index->index_data_table() != nullptr) {
+        table_ids.push_back(index->index_data_table()->id());
+      }
+    }
+  }
+
+  ReclaimStats stats;
+  stats.rows_purged = storage_->PurgeExpiredDeletedRows(now, table_ids);
+
+  // Dropped tables and columns are otherwise reclaimed only on a schema change
+  // or a read-only transaction, so an idle database never runs them. Both are
+  // idempotent and no-op once their backlog is drained.
+  storage_->CleanUpDeletedTables(now);
+  storage_->CleanUpDeletedColumns(now);
+
+#ifdef __GLIBC__
+  // Erasing from the storage maps returns nodes to the allocator's free lists,
+  // not to the OS, so RSS does not drop on its own. Ask glibc to release what
+  // it can; heap fragmentation limits how much is actually returnable.
+  malloc_trim(0);
+#endif
+
+  return stats;
 }
 
 }  // namespace backend

@@ -30,10 +30,15 @@
 #include "googlesql/public/analyzer_options.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/cord.h"
+#include "absl/strings/match.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/types/optional.h"
 #include "absl/types/variant.h"
 #include "backend/access/read.h"
+#include "backend/database/database.h"
 #include "backend/query/change_stream/change_stream_query_validator.h"
 #include "backend/query/query_engine.h"
 #include "common/constants.h"
@@ -219,6 +224,58 @@ int64_t HashRequest(const spanner_api::ExecuteBatchDmlRequest* request) {
 }  //  namespace
 
 // Executes a SQL statement, returning all results in a single reply.
+// Emulator-only escape hatch: SELECT EMULATOR_RECLAIM('T1', 'T2')
+//
+// Cloud Spanner reclaims storage in the background; the emulator does not, so
+// a long-lived container grows for its whole lifetime. This lets a local test
+// harness reclaim between batches instead of restarting the container.
+//
+// Recognised only as a whole statement, so it cannot collide with a real query
+// or a column named similarly. With no arguments it sweeps the whole database.
+constexpr char kReclaimPrefix[] = "SELECT EMULATOR_RECLAIM(";
+
+bool IsEmulatorReclaimStatement(absl::string_view sql) {
+  return absl::StartsWithIgnoreCase(absl::StripAsciiWhitespace(sql),
+                                    kReclaimPrefix);
+}
+
+// Extracts the single-quoted table names from the argument list. Returns an
+// empty vector for EMULATOR_RECLAIM(), meaning "the whole database".
+std::vector<std::string> ParseReclaimTableNames(absl::string_view sql) {
+  std::vector<std::string> table_names;
+  absl::string_view rest = absl::StripAsciiWhitespace(sql);
+  rest.remove_prefix(sizeof(kReclaimPrefix) - 1);
+  while (true) {
+    size_t open_quote = rest.find('\'');
+    if (open_quote == absl::string_view::npos) break;
+    rest.remove_prefix(open_quote + 1);
+    size_t close_quote = rest.find('\'');
+    if (close_quote == absl::string_view::npos) break;
+    table_names.emplace_back(rest.substr(0, close_quote));
+    rest.remove_prefix(close_quote + 1);
+  }
+  return table_names;
+}
+
+// Answers the reclaim statement with a one-row, one-column INT64 result set
+// holding the number of purged rows.
+absl::Status HandleEmulatorReclaim(std::shared_ptr<Session> session,
+                                   absl::string_view sql,
+                                   spanner_api::ResultSet* response) {
+  GOOGLESQL_ASSIGN_OR_RETURN(backend::Database::ReclaimStats stats,
+                   session->database()->ReclaimStorage(
+                       ParseReclaimTableNames(sql)));
+
+  auto* field = response->mutable_metadata()->mutable_row_type()->add_fields();
+  field->set_name("rows_purged");
+  field->mutable_type()->set_code(google::spanner::v1::TypeCode::INT64);
+  response->add_rows()->add_values()->set_string_value(
+      absl::StrCat(stats.rows_purged));
+  return absl::OkStatus();
+}
+
+}  // namespace
+
 absl::Status ExecuteSql(RequestContext* ctx,
                         const spanner_api::ExecuteSqlRequest* request,
                         spanner_api::ResultSet* response) {
@@ -226,6 +283,12 @@ absl::Status ExecuteSql(RequestContext* ctx,
   // valid throughout this function.
   GOOGLESQL_ASSIGN_OR_RETURN(std::shared_ptr<Session> session,
                    GetSession(ctx, request->session()));
+
+  // Emulator-only storage reclamation. Handled before transaction setup and
+  // query planning: it is not a real query and takes no transaction.
+  if (IsEmulatorReclaimStatement(request->sql())) {
+    return HandleEmulatorReclaim(session, request->sql(), response);
+  }
 
   // Get underlying transaction.
   bool is_dml_query = backend::IsDMLQuery(request->sql());

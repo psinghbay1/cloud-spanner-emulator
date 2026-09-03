@@ -300,6 +300,59 @@ void InMemoryStorage::CleanUpDeletedColumns(absl::Time timestamp) {
   }
 }
 
+int64_t InMemoryStorage::PurgeExpiredDeletedRows(
+    absl::Time timestamp, const std::vector<TableID>& table_ids) {
+  absl::MutexLock lock(mu_);
+  absl::MutexLock version_retention_period_lock(version_retention_period_mu_);
+  absl::Time expiration_time = timestamp - version_retention_period_;
+
+  // A row may only be erased when it is invisible at every timestamp a
+  // transaction may legally read. Reads below the retention floor are already
+  // rejected, so a row deleted before `expiration_time` and never rewritten
+  // since cannot be observed by anyone.
+  auto is_purgeable = [&](const Row& row) {
+    auto cell_itr = row.find(kExistsColumn);
+    if (cell_itr == row.end()) {
+      return false;
+    }
+    const Cell& cell = cell_itr->second;
+    // A version at or after the retention floor means the row may still be
+    // read, whether it resurrects the row or deletes it again.
+    if (cell.upper_bound(expiration_time) != cell.end()) {
+      return false;
+    }
+    // Row is deleted iff its newest version marks it non-existent.
+    const googlesql::Value& newest = cell.rbegin()->second;
+    return newest.is_valid() && !newest.bool_value();
+  };
+
+  int64_t purged = 0;
+  auto purge_table = [&](Table& table) {
+    for (auto it = table.begin(); it != table.end();) {
+      if (is_purgeable(it->second)) {
+        it = table.erase(it);
+        ++purged;
+      } else {
+        ++it;
+      }
+    }
+  };
+
+  if (table_ids.empty()) {
+    for (auto& [_, table] : tables_) {
+      purge_table(table);
+    }
+  } else {
+    for (const TableID& table_id : table_ids) {
+      auto table_itr = tables_.find(table_id);
+      if (table_itr != tables_.end()) {
+        purge_table(table_itr->second);
+      }
+    }
+  }
+  return purged;
+}
+
 void InMemoryStorage::MarkDroppedTable(absl::Time timestamp,
                                        TableID dropped_table_id) {
   absl::MutexLock lock(mu_);

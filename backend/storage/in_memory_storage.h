@@ -17,7 +17,12 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_IN_MEMORY_STORAGE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_IN_MEMORY_STORAGE_H_
 
+#include <cstdint>
+#include <map>
+#include <vector>
+
 #include "googlesql/public/value.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/time/time.h"
 #include "backend/common/ids.h"
 #include "backend/datamodel/key.h"
@@ -77,6 +82,10 @@ class InMemoryStorage : public Storage {
   void MarkDroppedColumn(absl::Time timestamp, TableID dropped_table_id,
                          ColumnID dropped_column_id) override
       ABSL_LOCKS_EXCLUDED(mu_);
+
+  int64_t PurgeExpiredDeletedRows(absl::Time timestamp,
+                                  const std::vector<TableID>& table_ids)
+      override ABSL_LOCKS_EXCLUDED(mu_);
 
  private:
   using Cell = std::map<absl::Time, googlesql::Value>;

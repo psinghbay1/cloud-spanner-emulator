@@ -299,6 +299,7 @@ cc_library(
     deps = [
         ":change_streams",
         "//backend/access:read",
+        "//backend/database",
         "//backend/query:query_engine",
         "//backend/query/change_stream:change_stream_query_validator",
         "//common:constants",
@@ -317,6 +318,7 @@ cc_library(
         "//frontend/server:request_context",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:cord",
         "@com_google_absl//absl/types:optional",
         "@com_google_absl//absl/types:variant",
