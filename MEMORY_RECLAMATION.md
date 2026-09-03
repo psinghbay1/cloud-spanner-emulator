@@ -183,7 +183,7 @@ Upstream's README states releases are built on Ubuntu with gcc. Use
 Only the files this fork adds or changes:
 
 ```
-HIGHNOTE.md                  this file
+MEMORY_RECLAMATION.md        this file
 setup.sh                     one-time host setup
 build.sh                     build + test (native or devcontainer)
 build_docker.sh              build the container image
