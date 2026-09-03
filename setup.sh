@@ -91,8 +91,31 @@ else
     ok "DNS resolves inside the build network"
   else
     warn "DNS FAILS inside the Docker build network"
-    daemon="$HOME/.docker/daemon.json"
-    if $CHECK_ONLY; then
+
+    # Distinguish "daemon.json not loaded yet" from "the patch will not help".
+    # A VPN/enterprise resolver can hand back private-range addresses and block
+    # public DNS, in which case adding 8.8.8.8 achieves nothing.
+    if grep -q '"dns"' "$HOME/.docker/daemon.json" 2>/dev/null; then
+      warn "daemon.json already sets dns -- Docker Desktop has NOT been restarted yet"
+      echo "       Restart Docker Desktop, then re-run: ./setup.sh --check"
+      FAILED=true
+      # Skip re-patching a file that is already correct.
+      daemon=""
+    else
+      daemon="$HOME/.docker/daemon.json"
+    fi
+
+    if [[ -n "${daemon:-}" ]] && ! nc -z -w 3 8.8.8.8 53 > /dev/null 2>&1; then
+      bad "8.8.8.8:53 is unreachable from this host (VPN or firewall?)."
+      echo "       Adding public DNS to daemon.json will not help. Use your"
+      echo "       corporate resolver's address instead, or build on a machine"
+      echo "       without the restriction."
+      FAILED=true
+      daemon=""
+    fi
+    if [[ -z "${daemon:-}" ]]; then
+      :  # Already diagnosed above; nothing further to patch.
+    elif $CHECK_ONLY; then
       bad "re-run without --check to patch $daemon"
       FAILED=true
     else
