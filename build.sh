@@ -5,6 +5,13 @@
 #   ./build.sh              # build everything, then run the reclamation tests
 #   ./build.sh test         # tests only (assumes a prior build)
 #   ./build.sh all-tests    # the full upstream test suite (slow: 30-60+ min)
+#   ./build.sh docker       # run the build+tests inside the upstream devcontainer
+#
+# NOTE: macOS cannot build this natively. The bundled PostgreSQL sources collide
+# with macOS builtins (strlcat/strlcpy) and a gRPC layering_check fails. Both are
+# pre-existing upstream issues, unrelated to the changes on this branch. The
+# README states releases are built on Ubuntu with gcc. Use `./build.sh docker`,
+# which runs the same commands inside the image the repo's .devcontainer uses.
 #
 # Run ./setup.sh first if this is a fresh machine -- it checks bazel, the JDK,
 # and Docker build-network DNS.
@@ -82,8 +89,24 @@ run_all_tests() {
   bazel test --test_output=errors //...
 }
 
-require_bazel
-require_jdk
+# Run the build and tests inside the upstream devcontainer image, which has the
+# Ubuntu/gcc toolchain the emulator actually supports. The bazel cache is kept in
+# a named volume so repeat runs are incremental.
+run_in_devcontainer() {
+  local image="gcr.io/cloud-spanner-emulator/devcontainer"
+  log "Running build + tests in $image"
+  docker run --rm -it \
+    -v "$SCRIPT_DIR:/workspace" \
+    -v spanner-emulator-bazel-cache:/root/.cache/bazel \
+    -w /workspace \
+    "$image" \
+    bash -lc "bazel test --test_output=errors ${RECLAIM_TEST_TARGETS[*]}"
+}
+
+if [[ "$MODE" != "docker" ]]; then
+  require_bazel
+  require_jdk
+fi
 
 case "$MODE" in
   build)
@@ -95,12 +118,15 @@ case "$MODE" in
   all-tests)
     run_all_tests
     ;;
+  docker)
+    run_in_devcontainer
+    ;;
   build-and-test)
     build_all
     run_reclaim_tests
     ;;
   *)
-    echo "usage: $0 [build|test|all-tests|build-and-test]" >&2
+    echo "usage: $0 [build|test|all-tests|docker|build-and-test]" >&2
     exit 1
     ;;
 esac
