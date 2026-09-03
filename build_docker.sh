@@ -28,6 +28,7 @@ VERIFY=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tag) IMAGE_TAG="$2"; shift 2 ;;
+    --jobs) BAZEL_JOBS="$2"; shift 2 ;;
     --verify) VERIFY=true; shift ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 1 ;;
@@ -64,8 +65,41 @@ EOM
 
 check_build_dns
 
+# .bazelrc sets --jobs=auto, which sizes parallelism to CPU count and ignores
+# memory. Each cc1plus compiling GoogleSQL needs roughly 1-2 GB, so when the
+# Docker VM has less RAM than (cores x 2 GB) the build is OOM-killed:
+#   gcc: fatal error: Killed signal terminated program cc1plus
+#   ResourceExhausted: cannot allocate memory
+# Budget one job per 2 GB of VM memory, floor 1, and never exceed the VM's CPUs.
+compute_bazel_jobs() {
+  if [[ -n "${BAZEL_JOBS:-}" ]]; then
+    log "Using BAZEL_JOBS=$BAZEL_JOBS (from environment)"
+    return
+  fi
+  local mem_bytes cpus by_mem
+  mem_bytes="$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0)"
+  cpus="$(docker info --format '{{.NCPU}}' 2>/dev/null || echo 0)"
+  if [[ "$mem_bytes" -le 0 || "$cpus" -le 0 ]]; then
+    log "Could not read Docker VM resources; leaving bazel parallelism at default"
+    return
+  fi
+  by_mem=$(( mem_bytes / (2 * 1024 * 1024 * 1024) ))
+  (( by_mem < 1 )) && by_mem=1
+  BAZEL_JOBS=$(( by_mem < cpus ? by_mem : cpus ))
+  log "Docker VM: $((mem_bytes / 1024 / 1024 / 1024)) GiB / ${cpus} CPUs -> --jobs=$BAZEL_JOBS"
+  if (( BAZEL_JOBS < 4 )); then
+    echo "  NOTE: this is low and the build will be slow. Raise Docker Desktop's"
+    echo "        memory limit (Settings > Resources) for a faster build."
+  fi
+}
+
+compute_bazel_jobs
+
+BUILD_ARGS=()
+[[ -n "${BAZEL_JOBS:-}" ]] && BUILD_ARGS+=(--build-arg "BAZEL_JOBS=$BAZEL_JOBS")
+
 log "Building $IMAGE_TAG (this takes a while on a cold cache)"
-docker build . -t "$IMAGE_TAG" -f build/docker/Dockerfile.ubuntu
+docker build "${BUILD_ARGS[@]}" . -t "$IMAGE_TAG" -f build/docker/Dockerfile.ubuntu
 
 log "Built $IMAGE_TAG"
 docker images --format '  {{.Repository}}:{{.Tag}}  {{.Size}}' | grep -F "${IMAGE_TAG%%:*}" || true
