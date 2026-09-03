@@ -150,6 +150,32 @@ EOM
   fi
 fi
 
+# --- 4. Docker VM memory ---------------------------------------------------
+# Compiling GoogleSQL includes tm_parser.cc, a bison-generated file that needs
+# several GB in a single cc1plus process. Capping --jobs does not help: one
+# process must fit. Docker Desktop defaults to a fraction of host RAM.
+log "Docker VM memory"
+if command -v docker > /dev/null 2>&1; then
+  vm_bytes="$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0)"
+  vm_gib=$(( vm_bytes / 1024 / 1024 / 1024 ))
+  host_gib=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1024 / 1024 / 1024 ))
+  if (( vm_gib >= 24 )); then
+    ok "${vm_gib} GiB available to Docker"
+  elif (( vm_gib >= 16 )); then
+    warn "${vm_gib} GiB available to Docker; the GoogleSQL build may still OOM"
+    echo "       tm_parser.cc alone needs several GB in one process."
+    echo "       Docker Desktop > Settings > Resources > Memory -> 24 GB or more."
+    (( host_gib > 0 )) && echo "       This host has ${host_gib} GiB."
+  else
+    bad "${vm_gib} GiB available to Docker -- too small to build the emulator"
+    echo "       Docker Desktop > Settings > Resources > Memory -> 24 GB or more."
+    (( host_gib > 0 )) && echo "       This host has ${host_gib} GiB."
+    FAILED=true
+  fi
+else
+  warn "docker not found; skipping"
+fi
+
 log "Summary"
 if $FAILED; then
   echo "  Some checks need attention (see FIX/FAIL above)."
