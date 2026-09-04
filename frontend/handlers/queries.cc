@@ -221,9 +221,6 @@ int64_t HashRequest(const spanner_api::ExecuteBatchDmlRequest* request) {
   return SerializeAndHashRequest(copy);
 }
 
-}  //  namespace
-
-// Executes a SQL statement, returning all results in a single reply.
 // Emulator-only escape hatch: SELECT EMULATOR_RECLAIM('T1', 'T2')
 //
 // Cloud Spanner reclaims storage in the background; the emulator does not, so
@@ -280,8 +277,9 @@ absl::Status HandleEmulatorReclaim(std::shared_ptr<Session> session,
   return absl::OkStatus();
 }
 
-}  // namespace
+}  //  namespace
 
+// Executes a SQL statement, returning all results in a single reply.
 absl::Status ExecuteSql(RequestContext* ctx,
                         const spanner_api::ExecuteSqlRequest* request,
                         spanner_api::ResultSet* response) {
