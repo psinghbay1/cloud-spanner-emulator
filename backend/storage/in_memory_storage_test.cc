@@ -1165,9 +1165,9 @@ TEST_F(InMemoryStorageTest, DeleteRowsInWindowRemovesTestRow) {
   EXPECT_EQ(storage_.DeleteRowsInWindow(now, {}, window), 1);
 
   std::vector<googlesql::Value> values;
-  EXPECT_FALSE(
-      storage_.Lookup(now, kTableId0, Key({Int64(2)}), {kColumnID}, &values)
-          .ok());
+  EXPECT_THAT(
+      storage_.Lookup(now, kTableId0, Key({Int64(2)}), {kColumnID}, &values),
+      googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
 }
 
 TEST_F(InMemoryStorageTest, DeleteRowsInWindowKeepsRowInsideNotAfterLag) {
