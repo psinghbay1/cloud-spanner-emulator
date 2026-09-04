@@ -107,7 +107,7 @@ SEED_DONE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 # Then, between test batches:
 ./reclaim.sh --all --not-before "$SEED_DONE" --not-after-lag 60s \
-             --delete-rows --prune-sessions
+             --delete-rows --prune-sessions --prune-operations
 ```
 
 Each row is kept or erased by the commit timestamp of its insert:
@@ -125,19 +125,24 @@ inserted and never deleted, which on a seeded database is most of it — the oth
 sweeps only reclaim garbage. `--prune-sessions` releases sessions the run
 abandoned, which the row sweeps cannot reach: sessions are frontend state, and
 their expiry never fires for a session nobody looks up again.
+`--prune-operations` releases the long-running operations left behind by schema
+changes. Together these four reach every category of memory the container
+retains.
 
 Drop `--delete-rows` for a non-destructive run that reclaims tombstones and
 superseded versions but never removes a live row:
 
 ```bash
-./reclaim.sh --all --not-before "$SEED_DONE" --not-after-lag 60s --prune-sessions
+./reclaim.sh --all --not-before "$SEED_DONE" --not-after-lag 60s \
+             --prune-sessions --prune-operations
 ```
 
 To limit the blast radius further, name the churn tables explicitly — seed
 tables are then untouched by construction:
 
 ```bash
-./reclaim.sh mydb Orders Events --not-after-lag 60s --delete-rows --prune-sessions
+./reclaim.sh mydb Orders Events --not-after-lag 60s --delete-rows \
+             --prune-sessions --prune-operations
 ```
 
 Note this is a full scan of every row in every table in scope. Run it between
@@ -153,7 +158,8 @@ SELECT EMULATOR_RECLAIM();                       -- whole database
 SELECT EMULATOR_RECLAIM(not_before => '2026-09-03T19:00:00Z',
                         not_after_lag => '60s',
                         delete_rows => true,
-                        prune_sessions => true); -- seeded database
+                        prune_sessions => true,
+                        prune_operations => true); -- seeded database
 ```
 
 Returns one row:
@@ -296,6 +302,25 @@ already dead.
 transaction evicts the oldest and calls `Close()` on it, which releases its lock
 handle. Locks therefore do not accumulate and cannot interfere with new
 transactions. Pruning a session releases the transactions retained under it.
+
+### Pruning completed operations
+
+A long-running operation is created for **every** `CreateDatabase` and
+`UpdateDdl`, and removed only when a client explicitly calls `DeleteOperation` --
+which clients rarely send. Nothing else prunes `operations_map_`, so a run with
+heavy schema churn holds every operation it ever created.
+
+```bash
+./reclaim.sh --all --prune-operations
+```
+
+The count comes back as a fifth column, `operations_pruned`.
+
+Only **completed** operations are pruned -- those whose response or error has
+been set. An in-flight operation is left alone. There is no time window here,
+unlike the row and session sweeps: a completed operation is finished work
+regardless of when it ran, and pruning one only makes a later `GetOperation`
+report `NOT_FOUND`, exactly as a client-issued `DeleteOperation` would.
 
 ### Verifying reclamation
 

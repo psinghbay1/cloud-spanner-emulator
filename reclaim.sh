@@ -26,6 +26,10 @@
 # lazy and never fires for a session nobody looks up again -- and the row sweeps
 # cannot reach them. Multiplexed sessions are left alone.
 #
+# --prune-operations erases completed long-running operations. One is created per
+# CreateDatabase and UpdateDdl and removed only by an explicit DeleteOperation,
+# which clients rarely send, so schema churn accumulates them.
+#
 # --not-before protects everything written at or before that instant: seed data
 # is the oldest data present, so a plain sweep reaches it first. --not-after-lag
 # holds back the newest writes, so an in-flight test never loses rows underneath
@@ -57,6 +61,7 @@ NOT_BEFORE=""
 NOT_AFTER_LAG=""
 DELETE_ROWS=false
 PRUNE_SESSIONS=false
+PRUNE_OPERATIONS=false
 ALL=false
 LIST=false
 
@@ -72,6 +77,7 @@ while [[ $# -gt 0 ]]; do
     --not-after-lag) NOT_AFTER_LAG="$2"; shift 2 ;;
     --delete-rows) DELETE_ROWS=true; shift ;;
     --prune-sessions) PRUNE_SESSIONS=true; shift ;;
+    --prune-operations) PRUNE_OPERATIONS=true; shift ;;
     -h|--help)   sed -n '2,40p' "$0"; exit 0 ;;
     --*)         echo "unknown flag: $1" >&2; exit 1 ;;
     *)           break ;;
@@ -165,6 +171,9 @@ print(payload["name"])')" || die "database \"${database}\" not found on ${PROJEC
   if [[ "$PRUNE_SESSIONS" == true ]]; then
     args+="${args:+, }prune_sessions => true"
   fi
+  if [[ "$PRUNE_OPERATIONS" == true ]]; then
+    args+="${args:+, }prune_operations => true"
+  fi
 
   response="$(api POST "${session}:executeSql" \
     "{\"sql\":\"SELECT EMULATOR_RECLAIM(${args})\"}")"
@@ -180,13 +189,14 @@ if "rows" not in payload:
 row = payload["rows"][0]
 print(row[0], row[1],
       row[2] if len(row) > 2 else 0,
-      row[3] if len(row) > 3 else 0)')" || exit 1
-  read -r rows versions deleted sessions <<< "$parsed"
+      row[3] if len(row) > 3 else 0,
+      row[4] if len(row) > 4 else 0)')" || exit 1
+  read -r rows versions deleted sessions operations <<< "$parsed"
 
   scope="whole database"
   [[ ${#TABLES[@]} -gt 0 ]] && scope="${#TABLES[@]} table(s)"
-  printf '%-28s %10s rows  %10s versions  %10s deleted  %8s sessions   (%s)\n' \
-    "$database" "$rows" "$versions" "$deleted" "$sessions" "$scope"
+  printf '%-28s %10s rows %10s versions %10s deleted %6s sess %6s ops   (%s)\n' \
+    "$database" "$rows" "$versions" "$deleted" "$sessions" "$operations" "$scope"
   total_rows=$(( total_rows + rows ))
   total_versions=$(( total_versions + versions ))
   total_deleted=$(( total_deleted + deleted ))

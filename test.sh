@@ -25,6 +25,7 @@ TEST_TARGETS=(
   "//backend/schema/updater:schema_updater_test"
   "//frontend/handlers:queries_test"
   "//frontend/collections:session_manager_test"
+  "//frontend/collections:operation_manager_test"
 )
 
 VERBOSE=false
@@ -75,6 +76,14 @@ frontend/collections/session_manager_test.cc
     PruneLeavesMultiplexedSessionsByDefault
     PruneIsIdempotent
     PruneRemovesOnlyTheSessionsPastTheBound
+
+frontend/collections/operation_manager_test.cc
+  PruneCompletedOperations -- reclaiming finished operations
+    PruneRemovesCompletedOperation
+    PruneRemovesFailedOperation
+    PruneKeepsInFlightOperation
+    PruneRemovesOnlyCompletedOperations
+    PruneIsIdempotent
 
 frontend/handlers/queries_test.cc
   EMULATOR_RECLAIM -- the statement, end to end over gRPC

@@ -42,6 +42,7 @@
 #include "backend/access/read.h"
 #include "backend/database/database.h"
 #include "backend/storage/storage.h"
+#include "frontend/collections/operation_manager.h"
 #include "frontend/collections/session_manager.h"
 #include "backend/query/change_stream/change_stream_query_validator.h"
 #include "backend/query/query_engine.h"
@@ -334,6 +335,17 @@ bool ParseReclaimPruneSessions(absl::string_view sql) {
   return false;
 }
 
+// True when the caller passed prune_operations => true.
+bool ParseReclaimPruneOperations(absl::string_view sql) {
+  for (const std::string& argument : SplitReclaimArguments(sql)) {
+    if (IsNamedArgument(argument, "prune_operations") &&
+        absl::EqualsIgnoreCase(NamedArgumentValue(argument), "true")) {
+      return true;
+    }
+  }
+  return false;
+}
+
 absl::StatusOr<backend::PurgeWindow> ParseReclaimWindow(absl::string_view sql,
                                                         absl::Time now) {
   backend::PurgeWindow window;
@@ -407,6 +419,16 @@ absl::Status HandleEmulatorReclaim(RequestContext* ctx,
             not_used_since);
   }
 
+  // Operations are created per CreateDatabase and UpdateDdl and removed only by
+  // an explicit DeleteOperation, so schema churn accumulates them. Only
+  // completed ones are pruned; there is no window, because a completed
+  // operation is finished work regardless of when it ran.
+  int64_t operations_pruned = 0;
+  if (ParseReclaimPruneOperations(sql)) {
+    operations_pruned =
+        ctx->env()->operation_manager()->PruneCompletedOperations();
+  }
+
   auto* row_type = response->mutable_metadata()->mutable_row_type();
   auto* rows_field = row_type->add_fields();
   rows_field->set_name("rows_purged");
@@ -420,12 +442,17 @@ absl::Status HandleEmulatorReclaim(RequestContext* ctx,
   auto* sessions_field = row_type->add_fields();
   sessions_field->set_name("sessions_pruned");
   sessions_field->mutable_type()->set_code(google::spanner::v1::TypeCode::INT64);
+  auto* operations_field = row_type->add_fields();
+  operations_field->set_name("operations_pruned");
+  operations_field->mutable_type()->set_code(
+      google::spanner::v1::TypeCode::INT64);
 
   auto* row = response->add_rows();
   row->add_values()->set_string_value(absl::StrCat(stats.rows_purged));
   row->add_values()->set_string_value(absl::StrCat(stats.versions_purged));
   row->add_values()->set_string_value(absl::StrCat(stats.rows_deleted));
   row->add_values()->set_string_value(absl::StrCat(sessions_pruned));
+  row->add_values()->set_string_value(absl::StrCat(operations_pruned));
   return absl::OkStatus();
 }
 

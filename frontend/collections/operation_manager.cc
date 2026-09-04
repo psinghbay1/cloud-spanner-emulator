@@ -70,6 +70,20 @@ absl::StatusOr<std::shared_ptr<Operation>> OperationManager::GetOperation(
   return itr->second;
 }
 
+int64_t OperationManager::PruneCompletedOperations() {
+  absl::MutexLock lock(mu_);
+  int64_t pruned = 0;
+  for (auto itr = operations_map_.begin(); itr != operations_map_.end();) {
+    if (itr->second->done()) {
+      itr = operations_map_.erase(itr);
+      ++pruned;
+    } else {
+      ++itr;
+    }
+  }
+  return pruned;
+}
+
 absl::Status OperationManager::DeleteOperation(
     const std::string& operation_uri) {
   absl::MutexLock lock(mu_);

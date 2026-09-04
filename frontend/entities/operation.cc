@@ -49,6 +49,11 @@ void Operation::SetResponse(const google::protobuf::Message& response) {
   status_ = absl::OkStatus();
 }
 
+bool Operation::done() const {
+  absl::MutexLock lock(mu_);
+  return response_ != nullptr || !status_.ok();
+}
+
 void Operation::ToProto(google::longrunning::Operation* operation_pb) {
   absl::MutexLock lock(mu_);
 
