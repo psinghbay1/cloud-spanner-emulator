@@ -38,16 +38,38 @@ def sh(*args, check=False):
     return subprocess.run(args, capture_output=True, text=True, check=check)
 
 
-def rss(container):
-    out = sh("docker", "stats", "--no-stream", "--format", "{{.MemUsage}}", container).stdout
-    value = out.split("/")[0].strip()
+def _to_mib(value):
+    value = value.strip()
     if not value:
         return float("nan")
     if "GiB" in value:
         return float(value.replace("GiB", "")) * 1024
     if "KiB" in value:
         return float(value.replace("KiB", "")) / 1024
+    if "B" == value[-1] and "iB" not in value:
+        return float(value[:-1]) / (1024 * 1024)
     return float(value.replace("MiB", ""))
+
+
+def resources(container):
+    """RSS, memory-limit share and CPU for the container, in one docker call."""
+    out = sh("docker", "stats", "--no-stream", "--format",
+             "{{.MemUsage}}|{{.MemPerc}}|{{.CPUPerc}}|{{.PIDs}}", container).stdout.strip()
+    if not out:
+        return {"rss": float("nan"), "mem_pct": float("nan"),
+                "cpu_pct": float("nan"), "pids": 0}
+    usage, mem_pct, cpu_pct, pids = out.split("|")
+    return {
+        "rss": _to_mib(usage.split("/")[0]),
+        "limit": _to_mib(usage.split("/")[1]),
+        "mem_pct": float(mem_pct.rstrip("%")),
+        "cpu_pct": float(cpu_pct.rstrip("%")),
+        "pids": int(pids),
+    }
+
+
+def rss(container):
+    return resources(container)["rss"]
 
 
 class Emulator:
@@ -110,9 +132,10 @@ class Emulator:
 
 
 RESULTS = []
+PEAK = {"rss": 0.0, "cpu": 0.0}
 
 
-def record(name, before, after, note=""):
+def record(name, before, after, note="", stats=None):
     delta = after - before
     if delta < -1:
         verdict = f"RECLAIMED {-delta:.1f} MiB"
@@ -120,8 +143,13 @@ def record(name, before, after, note=""):
         verdict = f"+{delta:.1f} MiB"
     else:
         verdict = "no change"
-    RESULTS.append((name, before, after, verdict, note))
-    print(f"  {name:42} {before:7.1f} -> {after:7.1f} MiB   {verdict} {note}")
+    pct = stats["mem_pct"] if stats else float("nan")
+    cpu = stats["cpu_pct"] if stats else float("nan")
+    PEAK["rss"] = max(PEAK["rss"], before, after)
+    PEAK["cpu"] = max(PEAK["cpu"], 0.0 if cpu != cpu else cpu)
+    RESULTS.append((name, before, after, verdict, note, pct, cpu))
+    print(f"  {name:42} {before:7.1f} -> {after:7.1f} MiB  "
+          f"[{pct:5.1f}% of cap, cpu {cpu:5.1f}%]   {verdict} {note}")
 
 
 def main():
@@ -160,7 +188,7 @@ def main():
         if args.reclaim:
             time.sleep(3)
             note = "purged=%s/%s" % emulator.reclaim(session, ["T"])
-        record("1. mutation delete, keySet all (30k)", before, rss(CONTAINER), note)
+        record("1. mutation delete, keySet all (30k)", before, rss(CONTAINER), note, resources(CONTAINER))
 
         # --- 2. DML delete, 10k rows --------------------------------------
         emulator.create_database("benchtwo", [
@@ -184,7 +212,7 @@ def main():
         if args.reclaim:
             time.sleep(3)
             note = "purged=%s/%s" % emulator.reclaim(session2, ["T"])
-        record("2. DML DELETE FROM t WHERE true (10k)", before, rss(CONTAINER), note)
+        record("2. DML DELETE FROM t WHERE true (10k)", before, rss(CONTAINER), note, resources(CONTAINER))
 
         # --- 3. DROP TABLE x10 --------------------------------------------
         emulator.create_database("benchthree", [
@@ -206,13 +234,13 @@ def main():
         note = ""
         if args.reclaim:
             note = "purged=%s/%s" % emulator.reclaim(session3)
-        record("3. DROP TABLE x10", before, rss(CONTAINER), note)
+        record("3. DROP TABLE x10", before, rss(CONTAINER), note, resources(CONTAINER))
 
         # --- 4. DROP DATABASE ---------------------------------------------
         before = rss(CONTAINER)
         emulator.delete(f"projects/{PROJECT}/instances/{INSTANCE}/databases/benchthree")
         time.sleep(5)
-        record("4. DROP DATABASE", before, rss(CONTAINER))
+        record("4. DROP DATABASE", before, rss(CONTAINER), "", resources(CONTAINER))
 
         # --- 6. DROP INDEX x142 (before deleting the instance) -------------
         # 142 indexes, split across two tables: Spanner caps a table at 128
@@ -237,27 +265,39 @@ def main():
         note = ""
         if args.reclaim:
             note = "purged=%s/%s" % emulator.reclaim(session4)
-        record("6. DROP INDEX x142", before, rss(CONTAINER), note)
+        record("6. DROP INDEX x142", before, rss(CONTAINER), note, resources(CONTAINER))
 
         # --- 5. DELETE INSTANCE -------------------------------------------
         before = rss(CONTAINER)
         emulator.delete(f"projects/{PROJECT}/instances/{INSTANCE}")
         time.sleep(6)
-        record("5. DELETE INSTANCE", before, rss(CONTAINER))
+        record("5. DELETE INSTANCE", before, rss(CONTAINER), "", resources(CONTAINER))
 
         # --- 7. restart container -----------------------------------------
         before = rss(CONTAINER)
         emulator.stop()
         emulator.start()
-        record("7. restart container", before, rss(CONTAINER))
+        record("7. restart container", before, rss(CONTAINER), "", resources(CONTAINER))
+        log = sh("docker", "logs", CONTAINER).stdout + \
+              sh("docker", "logs", CONTAINER).stderr
+        reclaim_lines = [line for line in log.splitlines() if "[reclaim]" in line]
+        if reclaim_lines:
+            print("\n  container [reclaim] log:")
+            for line in reclaim_lines[-8:]:
+                print(f"    {line.strip()[:150]}")
     finally:
         emulator.stop()
 
-    print("\n| Attempt | Before | After | Result |")
-    print("| --- | ---: | ---: | --- |")
-    for name, before, after, verdict, note in RESULTS:
+    print("\n| Attempt | Before | After | % of cap | CPU | Result |")
+    print("| --- | ---: | ---: | ---: | ---: | --- |")
+    for name, before, after, verdict, note, pct, cpu in RESULTS:
         suffix = f" ({note})" if note else ""
-        print(f"| {name} | {before:.1f} MiB | {after:.1f} MiB | {verdict}{suffix} |")
+        print(f"| {name} | {before:.1f} MiB | {after:.1f} MiB | "
+              f"{pct:.1f}% | {cpu:.1f}% | {verdict}{suffix} |")
+
+    baseline_rss = RESULTS[-1][2] if RESULTS else float("nan")
+    print(f"\nPeak RSS {PEAK['rss']:.1f} MiB, peak CPU {PEAK['cpu']:.1f}%, "
+          f"final {baseline_rss:.1f} MiB")
     return 0
 
 

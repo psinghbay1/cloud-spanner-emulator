@@ -311,6 +311,7 @@ cc_library(
         "//frontend/converters:reads",
         "//frontend/converters:types",
         "//frontend/converters:values",
+        "//frontend/entities:database",
         "//frontend/entities:session",
         "//frontend/entities:transaction",
         "//frontend/proto:partition_token_cc_proto",

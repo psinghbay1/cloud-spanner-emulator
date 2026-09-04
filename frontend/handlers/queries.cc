@@ -50,6 +50,7 @@
 #include "frontend/converters/reads.h"
 #include "frontend/converters/types.h"
 #include "frontend/converters/values.h"
+#include "frontend/entities/database.h"
 #include "frontend/entities/session.h"
 #include "frontend/entities/transaction.h"
 #include "frontend/handlers/change_streams.h"
@@ -259,8 +260,10 @@ std::vector<std::string> ParseReclaimTableNames(absl::string_view sql) {
 absl::Status HandleEmulatorReclaim(std::shared_ptr<Session> session,
                                    absl::string_view sql,
                                    spanner_api::ResultSet* response) {
+  // Session::database() hands back the frontend wrapper; ReclaimStorage lives on
+  // the backend database it holds.
   GOOGLESQL_ASSIGN_OR_RETURN(backend::Database::ReclaimStats stats,
-                   session->database()->ReclaimStorage(
+                   session->database()->backend()->ReclaimStorage(
                        ParseReclaimTableNames(sql)));
 
   auto* row_type = response->mutable_metadata()->mutable_row_type();
