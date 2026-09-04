@@ -8,6 +8,10 @@
 #   ./reclaim.sh --list                       # list databases, do nothing
 #   ./reclaim.sh --retention 1s mydb          # shorten the window first, then sweep
 #
+# Against another emulator -- a shard on a different port, or another host:
+#   ./reclaim.sh --host localhost:9021 --all
+#   ./reclaim.sh --host spanner-box:9020 --project my-proj --instance my-inst --all
+#
 # Seeded databases -- protect the seed data and the newest writes:
 #   ./reclaim.sh --all --not-before "$SEED_DONE" --not-after-lag 60s
 #
@@ -24,10 +28,14 @@
 # bound the sweep directly, leaving version_retention_period (and therefore
 # stale reads) alone.
 #
-# Environment (all optional):
-#   EMULATOR_REST   host:port of the REST gateway   (default localhost:9020)
-#   PROJECT         project id                      (default bay1-pj-lab-eng)
-#   INSTANCE        instance id                     (default local-spanner)
+# Flags override the environment, which overrides the defaults:
+#   --host HOST:PORT   REST gateway   (env EMULATOR_REST, default localhost:9020)
+#   --project ID       project id     (env PROJECT,       default bay1-pj-lab-eng)
+#   --instance ID      instance id    (env INSTANCE,      default local-spanner)
+#
+# The port is the REST gateway (9020 by default), NOT the gRPC port (9010).
+# developers/ci shards run additional emulators on their own ports; point --host
+# at whichever one you mean.
 #
 # EMULATOR ONLY. Cloud Spanner has no EMULATOR_RECLAIM statement; it reclaims
 # storage in the background. This requires a build of the memory-reclamation
@@ -38,8 +46,6 @@ set -euo pipefail
 REST="${EMULATOR_REST:-localhost:9020}"
 PROJECT="${PROJECT:-bay1-pj-lab-eng}"
 INSTANCE="${INSTANCE:-local-spanner}"
-BASE="http://${REST}/v1"
-PREFIX="projects/${PROJECT}/instances/${INSTANCE}/databases"
 
 RETENTION=""
 NOT_BEFORE=""
@@ -52,15 +58,24 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --all)       ALL=true; shift ;;
     --list)      LIST=true; shift ;;
+    --host)     REST="$2"; shift 2 ;;
+    --project)  PROJECT="$2"; shift 2 ;;
+    --instance) INSTANCE="$2"; shift 2 ;;
     --retention) RETENTION="$2"; shift 2 ;;
     --not-before) NOT_BEFORE="$2"; shift 2 ;;
     --not-after-lag) NOT_AFTER_LAG="$2"; shift 2 ;;
     --delete-rows) DELETE_ROWS=true; shift ;;
-    -h|--help)   sed -n '2,33p' "$0"; exit 0 ;;
+    -h|--help)   sed -n '2,40p' "$0"; exit 0 ;;
     --*)         echo "unknown flag: $1" >&2; exit 1 ;;
     *)           break ;;
   esac
 done
+
+# Computed after flag parsing so --host/--project/--instance take effect.
+# A bare host is accepted; the REST gateway's default port is assumed.
+[[ "$REST" == *:* ]] || REST="${REST}:9020"
+BASE="http://${REST}/v1"
+PREFIX="projects/${PROJECT}/instances/${INSTANCE}/databases"
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -90,7 +105,7 @@ for entry in payload.get("databases", []):
 # Reachability check up front: a connection error here is far clearer than a
 # JSON parse failure three functions deep.
 curl -sf "${BASE}/projects/${PROJECT}/instances" > /dev/null 2>&1 \
-  || die "no emulator REST gateway at ${REST} (set EMULATOR_REST to override)"
+  || die "no emulator REST gateway at ${REST} (use --host, or check the port is the REST one, 9020 by default, not gRPC 9010)"
 
 if [[ "$LIST" == true ]]; then
   list_databases

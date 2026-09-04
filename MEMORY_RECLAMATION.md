@@ -167,6 +167,37 @@ build-then-test.
 | `--jobs N` | cap bazel parallelism by hand |
 | `--no-low-memory` | opt out of the aggressive GCC garbage collection (on by default) |
 
+### Targeting a different emulator
+
+`reclaim.sh` talks to `localhost:9020` in project `bay1-pj-lab-eng`, instance
+`local-spanner` by default. Three flags redirect it, which matters when
+`developers/ci` sharding runs several emulators side by side, each on its own
+port:
+
+| Flag | Overrides | Default |
+|---|---|---|
+| `--host HOST:PORT` | `EMULATOR_REST` | `localhost:9020` |
+| `--project ID` | `PROJECT` | `bay1-pj-lab-eng` |
+| `--instance ID` | `INSTANCE` | `local-spanner` |
+
+Precedence is flag, then environment variable, then default, so existing
+invocations and any environment already exported keep working unchanged.
+
+```bash
+# A shard on another port
+./reclaim.sh --host localhost:9021 --all
+
+# An emulator on another machine, different project and instance
+./reclaim.sh --host spanner-box:9020 --project my-proj --instance my-inst --all
+
+# Environment still works where it is already set
+EMULATOR_REST=localhost:9021 ./reclaim.sh --all
+```
+
+The port is the **REST gateway** — 9020 by default — not the gRPC port 9010. A
+bare host with no port gets `:9020` appended. Pointing at 9010 fails with the
+same "no emulator REST gateway" message, which names the address it tried.
+
 ### Verifying reclamation
 
 Two harnesses, both measuring **container RSS** — the only measure that settles
