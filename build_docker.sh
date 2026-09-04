@@ -150,9 +150,16 @@ log "Smoke test: does reclamation actually return memory?"
 
 CONTAINER="spanner-emulator-fork-verify"
 docker rm -f "$CONTAINER" > /dev/null 2>&1 || true
-docker run -d --rm --name "$CONTAINER" -p 19210:9020 -m 3g "$IMAGE_TAG" > /dev/null
+# No --rm: the trap below owns removal. With both, `docker rm -f` races the
+# daemon's own auto-removal and blocks on it, which hangs the script after the
+# smoke test has already reported its result.
+docker run -d --name "$CONTAINER" -p 19210:9020 -m 3g "$IMAGE_TAG" > /dev/null
 
-cleanup() { docker rm -f "$CONTAINER" > /dev/null 2>&1 || true; }
+# Bounded so a wedged daemon cannot hang the script either; the container is
+# named, so a leftover is easy to remove by hand.
+cleanup() {
+  timeout 30 docker rm -f "$CONTAINER" > /dev/null 2>&1 || true
+}
 trap cleanup EXIT
 
 # Wait for the REST port rather than sleeping a fixed amount.
@@ -163,4 +170,14 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 
-python3 "$SCRIPT_DIR/verify_reclaim.py" --port 19210 --container "$CONTAINER"
+verify_status=0
+python3 "$SCRIPT_DIR/verify_reclaim.py" --port 19210 --container "$CONTAINER" \
+  || verify_status=$?
+
+# Say that the run finished, so a slow cleanup is never mistaken for a hang.
+if [[ "$verify_status" -eq 0 ]]; then
+  log "Verify complete. Removing the test container."
+else
+  log "Verify FAILED (exit $verify_status). Removing the test container."
+fi
+exit "$verify_status"
