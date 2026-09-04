@@ -17,6 +17,7 @@ unless a change is listed below.
 - [Repository layout](#repository-layout)
 - [Design notes](#design-notes)
 - [Status](#status)
+- [Handling concurrent transactions](#handling-concurrent-transactions)
 - [Keeping the fork current](#keeping-the-fork-current)
 
 ## Why this fork exists
@@ -562,6 +563,78 @@ shows little recovered, the next step is linking tcmalloc or jemalloc.
 - **Interleaved child rows** whose parent is purged are untested.
 - **Dropped databases** are not swept — the whole `Database` object is destroyed,
   so there is nothing left to reclaim.
+
+## Handling concurrent transactions
+
+Not a reclamation feature, but it comes up whenever a suite is pointed at the
+emulator for the first time, and it constrains *when* a sweep can safely run.
+
+### Why the emulator aborts them
+
+The emulator holds **one global lock**, not a per-key lock table
+(`backend/locking/manager.h`):
+
+```cpp
+LockHandle* active_handle_ ABSL_GUARDED_BY(mu_) = nullptr;
+```
+
+A single pointer for the whole emulator. There is no lock granularity, so a
+second read-write transaction collides even when it touches an unrelated table.
+
+`LockManager::EnqueueLock` (`backend/locking/manager.cc`) decides who loses when
+transaction B asks for the lock while A holds it:
+
+1. If B **is** A, the lock is granted — it is re-entrant.
+2. Otherwise, with probability `abort_current_transaction_probability`
+   (**default 20**), **A** is aborted and B takes the lock.
+3. Otherwise **B** is aborted with `AbortConcurrentTransaction`:
+   *"The emulator only supports one transaction at a time."*
+
+The coin flip is deliberate: it stops a stuck transaction from blocking new ones
+indefinitely, and it makes clients exercise their retry paths. The same check
+guards `ReserveCommitTimestamp`, so a conflict can also surface at commit.
+
+Real Spanner does per-key two-phase locking over a distributed lock table with
+wound-wait deadlock avoidance. The emulator exists for local API-correctness
+rather than concurrency fidelity, so it takes the simplest sound approach:
+serialize everything and abort the loser. `ABORTED` is a legal Spanner response,
+so a client that retries correctly still behaves correctly.
+
+### Options
+
+**1. Retry properly — the intended answer.** `ABORTED` is a normal Spanner
+status, and the official client libraries retry it automatically inside
+`runTransaction` / `TransactionRunner`. A suite that fails here is usually
+driving `BeginTransaction` / `Commit` by hand instead of using the retry
+wrapper. This is the only option with no downside, and it is also what makes the
+tests correct against production Spanner.
+
+**2. Tune who loses.** `--abort_current_transaction_probability` (default 20):
+
+| Value | Effect |
+| --- | --- |
+| `0` | always abort the **newcomer** |
+| `100` | always abort the **incumbent** |
+
+Neither adds concurrency; both make the outcome deterministic instead of a coin
+flip, which turns a flaky failure into a reproducible one. Cheap and safe.
+
+**3. Give each test its own database.** If the tests are independent, the
+contention is an artefact of sharing one database. The `developers/ci` pool
+already supports a database per shard, and this is often the real fix for a CI
+suite.
+
+**4. Make the lock per-key.** Replace `active_handle_` with a map from key range
+to holder, plus deadlock detection. This is a genuine feature rather than a
+tweak, and without wound-wait it trades aborts for deadlocks, which are worse.
+Not recommended alongside the reclamation work.
+
+### Why this matters for reclamation
+
+`EMULATOR_RECLAIM` runs under the same global lock, so a sweep issued while a
+transaction is in flight will abort one of the two. Run the sweeps **between
+test batches**, not under load — which is also what the full-scan cost of
+`--delete-rows` implies.
 
 ## Keeping the fork current
 
