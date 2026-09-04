@@ -12,6 +12,7 @@ unless a change is listed below.
 - [Why this fork exists](#why-this-fork-exists)
 - [What changed](#what-changed)
 - [Using it](#using-it)
+  - [If the database is seeded, use this](#if-the-database-is-seeded-use-this)
 - [Building](#building)
 - [Repository layout](#repository-layout)
 - [Design notes](#design-notes)
@@ -95,9 +96,60 @@ The fix is ~4 lines and is the strongest candidate to send upstream.
 
 ## Using it
 
+### If the database is seeded, use this
+
+A harness that seeds a database before a run must protect that seed data. Seed
+data is the **oldest** data present, so an unbounded sweep reaches it *first*.
+
+```bash
+# Capture the boundary the moment seeding finishes, before any test traffic.
+SEED_DONE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# Then, between test batches:
+./reclaim.sh --all --not-before "$SEED_DONE" --not-after-lag 60s --delete-rows
+```
+
+Each row is kept or erased by the commit timestamp of its insert:
+
+| Row committed | Result |
+| --- | --- |
+| at or before `$SEED_DONE` | **kept** — seed data |
+| between `$SEED_DONE` and now − 60s | **deleted** — test churn |
+| within the last 60 s | **kept** — a running test may still read it |
+
+Both bounds matter. Without `--not-before` the sweep deletes the seed data;
+without `--not-after-lag` it can delete rows out from under a test that is still
+running. `--delete-rows` is what frees memory held by **live** rows a test
+inserted and never deleted, which on a seeded database is most of it — the other
+sweeps only reclaim garbage.
+
+Drop `--delete-rows` for a non-destructive run that reclaims tombstones and
+superseded versions but never removes a live row:
+
+```bash
+./reclaim.sh --all --not-before "$SEED_DONE" --not-after-lag 60s
+```
+
+To limit the blast radius further, name the churn tables explicitly — seed
+tables are then untouched by construction:
+
+```bash
+./reclaim.sh mydb Orders Events --not-after-lag 60s --delete-rows
+```
+
+Note this is a full scan of every row in every table in scope. Run it between
+test batches, not under load. See
+[Bounded reclamation for seeded databases](#bounded-reclamation-for-seeded-databases)
+for the full semantics.
+
+### The statement
+
 ```sql
 SELECT EMULATOR_RECLAIM('Orders', 'LineItems');  -- scoped; also sweeps their indexes
 SELECT EMULATOR_RECLAIM();                       -- whole database
+SELECT EMULATOR_RECLAIM(not_before => '2026-09-03T19:00:00Z',
+                        not_after_lag => '60s',
+                        delete_rows => true);    -- seeded database
 ```
 
 Returns one row:
@@ -106,6 +158,13 @@ Returns one row:
 | --- | --- |
 | `rows_purged` | deleted rows whose tombstone predated the retention window |
 | `versions_purged` | superseded versions of rows that are still live |
+| `rows_deleted` | live rows erased inside the window; 0 unless `delete_rows` |
+
+> **On a seeded database, do not reach for `--retention` / a short
+> `version_retention_period` on its own.** It makes seed data eligible for
+> reclamation along with everything else. Use `--not-before` instead: it bounds
+> the sweep directly and leaves `version_retention_period` — and therefore stale
+> reads — alone.
 
 **Set a short retention window first**, or nothing recent is eligible:
 
