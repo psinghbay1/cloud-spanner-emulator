@@ -35,10 +35,12 @@
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/time/time.h"
 #include "absl/types/optional.h"
 #include "absl/types/variant.h"
 #include "backend/access/read.h"
 #include "backend/database/database.h"
+#include "backend/storage/storage.h"
 #include "backend/query/change_stream/change_stream_query_validator.h"
 #include "backend/query/query_engine.h"
 #include "common/constants.h"
@@ -329,7 +331,7 @@ absl::StatusOr<backend::PurgeWindow> ParseReclaimWindow(absl::string_view sql,
         IsNamedArgument(argument, "not_after")) {
       const std::string value = NamedArgumentValue(argument);
       if (!absl::ParseTime(absl::RFC3339_full, value, &parsed, &error)) {
-        return error::InvalidArgument(absl::StrCat(
+        return absl::InvalidArgumentError(absl::StrCat(
             "EMULATOR_RECLAIM: could not parse timestamp \"", value,
             "\": ", error));
       }
@@ -342,7 +344,7 @@ absl::StatusOr<backend::PurgeWindow> ParseReclaimWindow(absl::string_view sql,
       const std::string value = NamedArgumentValue(argument);
       absl::Duration lag;
       if (!absl::ParseDuration(value, &lag)) {
-        return error::InvalidArgument(absl::StrCat(
+        return absl::InvalidArgumentError(absl::StrCat(
             "EMULATOR_RECLAIM: could not parse duration \"", value, "\""));
       }
       window.not_after = now - lag;
@@ -350,7 +352,7 @@ absl::StatusOr<backend::PurgeWindow> ParseReclaimWindow(absl::string_view sql,
   }
   if (window.not_before.has_value() && window.not_after.has_value() &&
       *window.not_before >= *window.not_after) {
-    return error::InvalidArgument(
+    return absl::InvalidArgumentError(
         "EMULATOR_RECLAIM: not_before must be earlier than not_after");
   }
   return window;
@@ -370,7 +372,7 @@ absl::Status HandleEmulatorReclaim(std::shared_ptr<Session> session,
   // is never what a harness means. Require a bound rather than doing it.
   if (delete_rows && !window.not_before.has_value() &&
       !window.not_after.has_value()) {
-    return error::InvalidArgument(
+    return absl::InvalidArgumentError(
         "EMULATOR_RECLAIM: delete_rows requires not_before, not_after or "
         "not_after_lag -- refusing to erase every live row");
   }
