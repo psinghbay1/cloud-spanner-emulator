@@ -277,8 +277,36 @@ absl::StatusOr<Database::ReclaimStats> Database::ReclaimStorage(
           ? "whole database"
           : absl::StrCat(table_names.size(), " table(s): ",
                          absl::StrJoin(table_names, ", "));
+  // The bounds decide which data survives, so they belong in the log next to
+  // the counts. Without them a run that erased seed data is indistinguishable
+  // from one that protected it.
+  const std::string bounds = absl::StrCat(
+      "not_before=",
+      window.not_before.has_value()
+          ? absl::FormatTime(absl::RFC3339_full, *window.not_before,
+                             absl::UTCTimeZone())
+          : "<unset>",
+      ", not_after=",
+      window.not_after.has_value()
+          ? absl::FormatTime(absl::RFC3339_full, *window.not_after,
+                             absl::UTCTimeZone())
+          : absl::StrCat("<unset, using retention period> (effective ",
+                         absl::FormatTime(absl::RFC3339_full,
+                                          now - versioned_catalog_->version_retention_period(),
+                                          absl::UTCTimeZone()),
+                         ")"));
+
   ABSL_LOG(INFO) << "[reclaim] database=" << database_id_ << " start, scope=" << scope
-                 << ", resolved " << table_ids.size() << " storage table(s)";
+                 << ", resolved " << table_ids.size() << " storage table(s)"
+                 << ", " << bounds
+                 << ", delete_rows=" << (delete_rows_in_window ? "true" : "false");
+
+  if (delete_rows_in_window && !window.not_before.has_value()) {
+    ABSL_LOG(WARNING)
+        << "[reclaim] database=" << database_id_
+        << " delete_rows without not_before: every live row older than "
+           "not_after is eligible, including anything seeded before this run";
+  }
 
   const int64_t heap_before = HeapBytesInUse();
 

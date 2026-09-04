@@ -320,6 +320,7 @@ cc_library(
         "//frontend/proto:partition_token_cc_proto",
         "//frontend/server:handler",
         "//frontend/server:request_context",
+        "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",

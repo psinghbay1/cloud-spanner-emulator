@@ -344,6 +344,31 @@ because it is the same script and the same container memory cap.
 
 ### Reclamation logging
 
+Every sweep is logged inside the container, so a run can be diagnosed from
+`docker logs` alone — the CLI's own output is gone once the caller exits:
+
+```
+docker logs <container> 2>&1 | grep '\[reclaim\]'
+```
+
+```
+[reclaim] statement: SELECT EMULATOR_RECLAIM(not_before => '...', delete_rows => true)
+[reclaim] database=testdb start, scope=whole database, resolved 12 storage table(s),
+          not_before=2026-09-03T19:00:00Z, not_after=<unset, using retention period>
+          (effective 2026-09-03T19:59:00Z), delete_rows=true
+[reclaim] prune_sessions not_used_since=2026-09-03T19:59:00Z, sessions_pruned=18
+[reclaim] prune_operations completed_only=true, operations_pruned=4
+[reclaim] database=testdb done, rows_deleted=..., rows_purged=..., versions_purged=...,
+          heap_before=... MiB, after_purge=... MiB (freed ...), after_trim=... MiB
+          (returned ... to the OS)
+```
+
+The statement is logged verbatim, so a mistyped argument that was silently
+ignored is still visible. `delete_rows` without `not_before` additionally logs a
+**warning**: every live row older than `not_after` is then eligible, including
+anything seeded before the run.
+
+
 Every `ReclaimStorage()` call logs to the container log, so an operator can
 confirm from `docker logs` that reclamation ran and what it recovered:
 

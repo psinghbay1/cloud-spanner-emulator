@@ -28,6 +28,7 @@
 #include "google/spanner/v1/spanner.pb.h"
 #include "google/spanner/v1/transaction.pb.h"
 #include "googlesql/public/analyzer_options.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
@@ -391,6 +392,10 @@ absl::Status HandleEmulatorReclaim(RequestContext* ctx,
                                    spanner_api::ResultSet* response) {
   // Session::database() hands back the frontend wrapper; ReclaimStorage lives on
   // the backend database it holds.
+  // The statement verbatim, so the log shows what was asked for even if an
+  // argument was mistyped and silently ignored.
+  ABSL_LOG(INFO) << "[reclaim] statement: " << sql;
+
   GOOGLESQL_ASSIGN_OR_RETURN(backend::PurgeWindow window,
                    ParseReclaimWindow(sql, absl::Now()));
   const bool delete_rows = ParseReclaimDeleteRows(sql);
@@ -417,6 +422,12 @@ absl::Status HandleEmulatorReclaim(RequestContext* ctx,
     sessions_pruned =
         ctx->env()->session_manager()->PruneSessionsNotUsedSince(
             not_used_since);
+    // Logged in the container so a harness run can be diagnosed from the log
+    // alone; the CLI's own output is gone once the caller exits.
+    ABSL_LOG(INFO) << "[reclaim] prune_sessions not_used_since="
+                   << absl::FormatTime(absl::RFC3339_full, not_used_since,
+                                       absl::UTCTimeZone())
+                   << ", sessions_pruned=" << sessions_pruned;
   }
 
   // Operations are created per CreateDatabase and UpdateDdl and removed only by
@@ -427,6 +438,8 @@ absl::Status HandleEmulatorReclaim(RequestContext* ctx,
   if (ParseReclaimPruneOperations(sql)) {
     operations_pruned =
         ctx->env()->operation_manager()->PruneCompletedOperations();
+    ABSL_LOG(INFO) << "[reclaim] prune_operations completed_only=true"
+                   << ", operations_pruned=" << operations_pruned;
   }
 
   auto* row_type = response->mutable_metadata()->mutable_row_type();
