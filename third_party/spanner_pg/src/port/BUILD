@@ -151,7 +151,19 @@ cc_library(
         "-D_GNU_SOURCE",
         "-DFRONTEND",
         "-fexceptions",
-    ],
+    ] + select({
+        # This target compiles the same sources as :port_srv, so it needs the
+        # same architecture flags: the _mm_crc32_*/__crc32* intrinsics in
+        # pg_crc32c_sse42.c and pg_crc32c_armv8.c are always_inline and fail to
+        # compile without them.
+        "@platforms//cpu:aarch64": [
+            "-march=armv8-a+crc",
+        ],
+        "@platforms//cpu:x86_64": [
+            "-msse4.2",
+        ],
+        "//conditions:default": [],
+    }),
     includes = [
         ".",
     ],
