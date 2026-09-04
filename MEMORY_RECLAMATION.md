@@ -642,7 +642,7 @@ That is strictly worse than the current behaviour. Doing this properly means
 wound-wait or a wait-for graph, and interval-overlap conflict detection rather
 than a hash lookup, since `KeyRange` is a range and not a point.
 
-Worth its own ticket with its own tests. It is orthogonal to reclamation, and
+Tracked as SINF-4997. It is orthogonal to reclamation, and
 bundling it here would tie a memory fix to a much riskier change.
 
 ### Why this matters for reclamation
