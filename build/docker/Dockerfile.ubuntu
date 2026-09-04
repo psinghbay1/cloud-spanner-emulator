@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 #
 # Copyright 2020 Google LLC
 #
@@ -92,7 +93,16 @@ ENV BAZEL_JOBS_ARG=${BAZEL_JOBS:+--jobs=${BAZEL_JOBS}}
 # Empty by default so upstream behaviour is unchanged.
 ARG GCC_MEMORY_COPTS=""
 ENV GCC_MEMORY_ARGS=${GCC_MEMORY_COPTS:+${GCC_MEMORY_COPTS}}
-RUN bazel build -c opt ${BAZEL_JOBS_ARG} ${GCC_MEMORY_ARGS} \
+
+# A Bazel disk cache, mounted from the host as a BuildKit cache mount, survives
+# Docker layer invalidation. Without it, editing MODULE.bazel or .bazelrc forces
+# a full GoogleSQL rebuild (~2h); with it, Bazel reuses the compiled artifacts
+# and the same edit costs minutes. The mount is not part of the image, so the
+# published image is unchanged.
+ENV BAZEL_DISK_CACHE=/root/.cache/bazel-disk
+RUN --mount=type=cache,target=/root/.cache/bazel-disk,sharing=locked \
+    bazel build -c opt ${BAZEL_JOBS_ARG} ${GCC_MEMORY_ARGS} \
+    --disk_cache=${BAZEL_DISK_CACHE} \
     @com_google_googlesql//googlesql/public:value \
     @com_google_googlesql//googlesql/public:analyzer
 
@@ -106,7 +116,9 @@ RUN find third_party/spanner_pg -name "nodes.h" -exec sed -i 's/enum NodeTag : i
 # Since we are only copying the binaries to the release image, we don't need to
 # build the rest of the targets.
 ENV EXTRA_BAZEL_ARGS="--tool_java_runtime_version=local_jdk"
-RUN bazel build -c opt ${BAZEL_JOBS_ARG} ${GCC_MEMORY_ARGS} \
+RUN --mount=type=cache,target=/root/.cache/bazel-disk,sharing=locked \
+    bazel build -c opt ${BAZEL_JOBS_ARG} ${GCC_MEMORY_ARGS} \
+    --disk_cache=${BAZEL_DISK_CACHE} \
     //binaries:emulator_main \
     //binaries:gateway_main
 

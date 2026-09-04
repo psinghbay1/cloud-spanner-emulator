@@ -124,6 +124,25 @@ wherever your harness has a natural boundary.
 Any client that can run a query works: `spanner-cli`, JDBC, the official client
 libraries, or plain `curl` against the REST gateway on port 9020.
 
+`reclaim.sh` wraps all of that:
+
+```bash
+./reclaim.sh mydb                      # sweep the whole database
+./reclaim.sh mydb Orders LineItems     # sweep only those tables
+./reclaim.sh --all                     # every database on the emulator
+./reclaim.sh --list                    # list databases, change nothing
+./reclaim.sh --retention 1s mydb       # shorten the window first, then sweep
+```
+
+```
+Orders                          41233 rows        8817 versions   (whole database)
+```
+
+Reads `EMULATOR_REST` (default `localhost:9020`), `PROJECT` and `INSTANCE` from
+the environment. It fails with a clear message when the emulator is unreachable,
+the database does not exist, or the statement is rejected -- the last of which
+means you are pointed at a stock emulator rather than a fork build.
+
 **Emulator-only.** Cloud Spanner has no such statement; it reclaims storage in the
 background. Never write production code against it.
 
@@ -233,6 +252,25 @@ at roughly 10-20% more compile time. Unlike lowering `-O` they do **not** change
 the generated code, which is why they are preferred over `-O0` on the offending
 file. Disable with `--no-low-memory`.
 
+### Build caching
+
+Two independent caches, and the distinction matters when estimating a rebuild:
+
+**Docker layer cache.** `COPY . .` sits *after* the GoogleSQL build, so editing
+emulator sources rebuilds only the binaries (~30 min). Editing `MODULE.bazel`,
+`.bazelrc`, `.bazelversion` or `build/bazel/` invalidates the GoogleSQL layer and
+costs the full ~2.5 h. The `BAZEL_JOBS` and `GCC_MEMORY_COPTS` build args feed
+that layer too, so changing `--jobs` or toggling `--no-low-memory` also forces a
+full rebuild.
+
+**Bazel disk cache.** A BuildKit cache mount at `/root/.cache/bazel-disk`,
+persisted on the host and passed to Bazel as `--disk_cache`. It survives Docker
+layer invalidation, so even a `.bazelrc` edit reuses compiled artifacts instead
+of recompiling GoogleSQL. The mount is not part of the image, so what gets
+published is unchanged.
+
+Clear it with `docker builder prune --filter type=exec.cachemount`.
+
 ### Platform support
 
 macOS **cannot** build this natively — two pre-existing upstream issues block it,
@@ -256,6 +294,7 @@ build.sh                     build + test (native or devcontainer)
 build_docker.sh              build the container image
 verify_reclaim.py            single-cycle RSS check (used by --verify)
 benchmark_reclaim.py         seven-scenario RSS benchmark, comparable between images
+reclaim.sh                   CLI wrapper for SELECT EMULATOR_RECLAIM(...)
 
 backend/storage/
   storage.h                  + PurgeExpiredDeletedRows, PurgeExpiredVersions
