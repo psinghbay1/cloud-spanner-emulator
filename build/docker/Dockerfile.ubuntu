@@ -45,6 +45,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     default-jdk \
     protobuf-compiler \
     python3 \
+    lld \
     && add-apt-repository ppa:ubuntu-toolchain-r/test -y \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -99,9 +100,16 @@ ENV GCC_MEMORY_ARGS=${GCC_MEMORY_COPTS:+${GCC_MEMORY_COPTS}}
 # a full GoogleSQL rebuild (~2h); with it, Bazel reuses the compiled artifacts
 # and the same edit costs minutes. The mount is not part of the image, so the
 # published image is unchanged.
+# Bazel's C++ toolchain selects gold when it is installed, but gold crashes
+# linking the emulator binary on aarch64: "internal error in
+# try_fix_erratum_843419_optimized, at gold/aarch64.cc" -- its Cortex-A53
+# erratum workaround fails on a binary this large. LLD has no such defect and
+# links faster, so use it on every architecture.
+ENV BAZEL_LINK_ARGS="--linkopt=-fuse-ld=lld"
+
 ENV BAZEL_DISK_CACHE=/root/.cache/bazel-disk
 RUN --mount=type=cache,target=/root/.cache/bazel-disk,sharing=locked \
-    bazel build -c opt ${BAZEL_JOBS_ARG} ${GCC_MEMORY_ARGS} \
+    bazel build -c opt ${BAZEL_JOBS_ARG} ${GCC_MEMORY_ARGS} ${BAZEL_LINK_ARGS} \
     --disk_cache=${BAZEL_DISK_CACHE} \
     @com_google_googlesql//googlesql/public:value \
     @com_google_googlesql//googlesql/public:analyzer
@@ -117,7 +125,7 @@ RUN find third_party/spanner_pg -name "nodes.h" -exec sed -i 's/enum NodeTag : i
 # build the rest of the targets.
 ENV EXTRA_BAZEL_ARGS="--tool_java_runtime_version=local_jdk"
 RUN --mount=type=cache,target=/root/.cache/bazel-disk,sharing=locked \
-    bazel build -c opt ${BAZEL_JOBS_ARG} ${GCC_MEMORY_ARGS} \
+    bazel build -c opt ${BAZEL_JOBS_ARG} ${GCC_MEMORY_ARGS} ${BAZEL_LINK_ARGS} \
     --disk_cache=${BAZEL_DISK_CACHE} \
     //binaries:emulator_main \
     //binaries:gateway_main
