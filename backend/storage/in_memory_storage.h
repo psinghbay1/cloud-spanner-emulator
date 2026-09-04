@@ -84,11 +84,18 @@ class InMemoryStorage : public Storage {
       ABSL_LOCKS_EXCLUDED(mu_);
 
   int64_t PurgeExpiredDeletedRows(absl::Time timestamp,
-                                  const std::vector<TableID>& table_ids)
+                                  const std::vector<TableID>& table_ids,
+                                  const PurgeWindow& window)
       override ABSL_LOCKS_EXCLUDED(mu_);
 
   int64_t PurgeExpiredVersions(absl::Time timestamp,
-                               const std::vector<TableID>& table_ids) override
+                               const std::vector<TableID>& table_ids,
+                               const PurgeWindow& window) override
+      ABSL_LOCKS_EXCLUDED(mu_);
+
+  int64_t DeleteRowsInWindow(absl::Time timestamp,
+                             const std::vector<TableID>& table_ids,
+                             const PurgeWindow& window) override
       ABSL_LOCKS_EXCLUDED(mu_);
 
  private:

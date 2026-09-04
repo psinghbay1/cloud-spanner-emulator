@@ -18,6 +18,7 @@
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_STORAGE_H_
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "googlesql/public/value.h"
@@ -39,6 +40,25 @@ namespace backend {
 // There will be a Storage instance for each database created. The current
 // interface is grow-only, i.e. once data is added, it will not be deleted.
 // Storage is thread-safe.
+// Bounds a reclamation sweep.
+//
+// Both bounds are optional and default to the retention behaviour: an unset
+// `not_after` means "now minus version_retention_period", and an unset
+// `not_before` means "no lower bound".
+//
+// `not_before` exists for harnesses that seed a database before a run. Seed
+// data is the OLDEST data present, so an unbounded sweep reaches it first.
+// Setting `not_before` to the moment seeding finished protects it: rows first
+// written at or before that instant are never erased, and only their
+// superseded versions inside the window are trimmed.
+struct PurgeWindow {
+  // Nothing at or below this instant is touched. Unset means no lower bound.
+  std::optional<absl::Time> not_before;
+  // Nothing at or above this instant is touched. Unset means the sweep uses
+  // the database's version_retention_period, as it always has.
+  std::optional<absl::Time> not_after;
+};
+
 class Storage {
  public:
   virtual ~Storage() {}
@@ -107,7 +127,8 @@ class Storage {
   // `table_ids` scopes the sweep; an empty vector sweeps every table. Returns
   // the number of row keys erased.
   virtual int64_t PurgeExpiredDeletedRows(
-      absl::Time timestamp, const std::vector<TableID>& table_ids) = 0;
+      absl::Time timestamp, const std::vector<TableID>& table_ids,
+      const PurgeWindow& window = {}) = 0;
 
   // Erases superseded versions of LIVE rows that are older than the version
   // retention period.
@@ -123,7 +144,27 @@ class Storage {
   // `table_ids` scopes the sweep; an empty vector sweeps every table. Returns
   // the number of versions erased.
   virtual int64_t PurgeExpiredVersions(
-      absl::Time timestamp, const std::vector<TableID>& table_ids) = 0;
+      absl::Time timestamp, const std::vector<TableID>& table_ids,
+      const PurgeWindow& window = {}) = 0;
+
+  // DESTRUCTIVE. Erases LIVE rows first written inside `window` -- rows the
+  // application never deleted and can still read.
+  //
+  // The other two sweeps only reclaim garbage: tombstones of already-deleted
+  // rows, and superseded versions. Neither frees the memory held by live rows
+  // a test inserted, which on a seeded database is most of it. This does, and
+  // is therefore opt-in: a caller must ask for it explicitly.
+  //
+  // `window.not_before` is the seed boundary -- rows first written at or
+  // before it are kept, so seeding survives. `window.not_after` holds back the
+  // newest writes so an in-flight test does not lose rows underneath it. A
+  // window with neither bound set erases every live row in the named tables,
+  // so callers should always set at least one.
+  //
+  // Returns the number of row keys erased.
+  virtual int64_t DeleteRowsInWindow(absl::Time timestamp,
+                                     const std::vector<TableID>& table_ids,
+                                     const PurgeWindow& window) = 0;
 };
 
 }  // namespace backend

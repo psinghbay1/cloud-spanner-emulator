@@ -249,7 +249,8 @@ const Schema* Database::GetLatestSchema() const {
 }
 
 absl::StatusOr<Database::ReclaimStats> Database::ReclaimStorage(
-    const std::vector<std::string>& table_names) {
+    const std::vector<std::string>& table_names, const PurgeWindow& window,
+    bool delete_rows_in_window) {
   const absl::Time now = clock_->Now();
 
   // Resolve names to storage TableIDs. An index keeps its rows in its own data
@@ -282,8 +283,14 @@ absl::StatusOr<Database::ReclaimStats> Database::ReclaimStorage(
   const int64_t heap_before = HeapBytesInUse();
 
   ReclaimStats stats;
-  stats.rows_purged = storage_->PurgeExpiredDeletedRows(now, table_ids);
-  stats.versions_purged = storage_->PurgeExpiredVersions(now, table_ids);
+  // Destructive sweep first: deleting a live row removes its versions too, so
+  // running it first leaves the purge sweeps less to walk.
+  if (delete_rows_in_window) {
+    stats.rows_deleted = storage_->DeleteRowsInWindow(now, table_ids, window);
+  }
+  stats.rows_purged = storage_->PurgeExpiredDeletedRows(now, table_ids, window);
+  stats.versions_purged =
+      storage_->PurgeExpiredVersions(now, table_ids, window);
 
   // Dropped tables and columns are otherwise reclaimed only on a schema change
   // or a read-only transaction, so an idle database never runs them. Both are
@@ -308,6 +315,7 @@ absl::StatusOr<Database::ReclaimStats> Database::ReclaimStorage(
   // delta shows what the engine freed, the trim delta what glibc handed back to
   // the OS. The two are different questions and both matter.
   ABSL_LOG(INFO) << "[reclaim] database=" << database_id_ << " done"
+                 << ", rows_deleted=" << stats.rows_deleted
                  << ", rows_purged=" << stats.rows_purged
                  << ", versions_purged=" << stats.versions_purged
                  << ", heap_before=" << MiB(heap_before) << " MiB"

@@ -237,22 +237,123 @@ bool IsEmulatorReclaimStatement(absl::string_view sql) {
                                     kReclaimPrefix);
 }
 
-// Extracts the single-quoted table names from the argument list. Returns an
-// empty vector for EMULATOR_RECLAIM(), meaning "the whole database".
-std::vector<std::string> ParseReclaimTableNames(absl::string_view sql) {
-  std::vector<std::string> table_names;
+// Splits the argument list into its comma-separated arguments, ignoring commas
+// inside quotes. Returns the text between the outermost parentheses.
+std::vector<std::string> SplitReclaimArguments(absl::string_view sql) {
   absl::string_view rest = absl::StripAsciiWhitespace(sql);
   rest.remove_prefix(sizeof(kReclaimPrefix) - 1);
-  while (true) {
-    size_t open_quote = rest.find('\'');
-    if (open_quote == absl::string_view::npos) break;
-    rest.remove_prefix(open_quote + 1);
-    size_t close_quote = rest.find('\'');
-    if (close_quote == absl::string_view::npos) break;
-    table_names.emplace_back(rest.substr(0, close_quote));
-    rest.remove_prefix(close_quote + 1);
+  size_t close_paren = rest.rfind(')');
+  if (close_paren != absl::string_view::npos) {
+    rest = rest.substr(0, close_paren);
+  }
+
+  std::vector<std::string> arguments;
+  bool in_quotes = false;
+  size_t start = 0;
+  for (size_t i = 0; i < rest.size(); ++i) {
+    if (rest[i] == '\'') {
+      in_quotes = !in_quotes;
+    } else if (rest[i] == ',' && !in_quotes) {
+      arguments.emplace_back(absl::StripAsciiWhitespace(
+          rest.substr(start, i - start)));
+      start = i + 1;
+    }
+  }
+  absl::string_view last = absl::StripAsciiWhitespace(rest.substr(start));
+  if (!last.empty()) arguments.emplace_back(last);
+  return arguments;
+}
+
+// True for a named argument of the form `name => value`.
+bool IsNamedArgument(absl::string_view argument, absl::string_view name) {
+  size_t arrow = argument.find("=>");
+  if (arrow == absl::string_view::npos) return false;
+  return absl::EqualsIgnoreCase(
+      absl::StripAsciiWhitespace(argument.substr(0, arrow)), name);
+}
+
+// The value of a named argument, with its surrounding quotes removed.
+std::string NamedArgumentValue(absl::string_view argument) {
+  absl::string_view value =
+      absl::StripAsciiWhitespace(argument.substr(argument.find("=>") + 2));
+  if (value.size() >= 2 && value.front() == '\'' && value.back() == '\'') {
+    value = value.substr(1, value.size() - 2);
+  }
+  return std::string(value);
+}
+
+// Extracts the single-quoted table names from the argument list, skipping the
+// named arguments. Returns an empty vector for EMULATOR_RECLAIM(), meaning
+// "the whole database".
+std::vector<std::string> ParseReclaimTableNames(absl::string_view sql) {
+  std::vector<std::string> table_names;
+  for (const std::string& argument : SplitReclaimArguments(sql)) {
+    if (argument.find("=>") != std::string::npos) continue;
+    absl::string_view name = argument;
+    if (name.size() >= 2 && name.front() == '\'' && name.back() == '\'') {
+      name = name.substr(1, name.size() - 2);
+    }
+    if (!name.empty()) table_names.emplace_back(name);
   }
   return table_names;
+}
+
+// Reads the optional window bounds:
+//
+//   not_before    => '2026-09-03T19:00:00Z'   protect everything seeded earlier
+//   not_after     => '2026-09-03T20:00:00Z'   absolute upper bound
+//   not_after_lag => '60s'                    upper bound relative to now
+//
+// not_after_lag is the useful form for a long run: it keeps the newest minute
+// of writes safe no matter how long the suite takes. Absent bounds leave the
+// retention behaviour untouched.
+// True when the caller passed delete_rows => true, opting in to erasing live
+// rows whose commit timestamp falls inside the window.
+bool ParseReclaimDeleteRows(absl::string_view sql) {
+  for (const std::string& argument : SplitReclaimArguments(sql)) {
+    if (IsNamedArgument(argument, "delete_rows") &&
+        absl::EqualsIgnoreCase(NamedArgumentValue(argument), "true")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+absl::StatusOr<backend::PurgeWindow> ParseReclaimWindow(absl::string_view sql,
+                                                        absl::Time now) {
+  backend::PurgeWindow window;
+  for (const std::string& argument : SplitReclaimArguments(sql)) {
+    absl::Time parsed;
+    std::string error;
+    if (IsNamedArgument(argument, "not_before") ||
+        IsNamedArgument(argument, "not_after")) {
+      const std::string value = NamedArgumentValue(argument);
+      if (!absl::ParseTime(absl::RFC3339_full, value, &parsed, &error)) {
+        return error::InvalidArgument(absl::StrCat(
+            "EMULATOR_RECLAIM: could not parse timestamp \"", value,
+            "\": ", error));
+      }
+      if (IsNamedArgument(argument, "not_before")) {
+        window.not_before = parsed;
+      } else {
+        window.not_after = parsed;
+      }
+    } else if (IsNamedArgument(argument, "not_after_lag")) {
+      const std::string value = NamedArgumentValue(argument);
+      absl::Duration lag;
+      if (!absl::ParseDuration(value, &lag)) {
+        return error::InvalidArgument(absl::StrCat(
+            "EMULATOR_RECLAIM: could not parse duration \"", value, "\""));
+      }
+      window.not_after = now - lag;
+    }
+  }
+  if (window.not_before.has_value() && window.not_after.has_value() &&
+      *window.not_before >= *window.not_after) {
+    return error::InvalidArgument(
+        "EMULATOR_RECLAIM: not_before must be earlier than not_after");
+  }
+  return window;
 }
 
 // Answers the reclaim statement with a one-row, one-column INT64 result set
@@ -262,9 +363,20 @@ absl::Status HandleEmulatorReclaim(std::shared_ptr<Session> session,
                                    spanner_api::ResultSet* response) {
   // Session::database() hands back the frontend wrapper; ReclaimStorage lives on
   // the backend database it holds.
+  GOOGLESQL_ASSIGN_OR_RETURN(backend::PurgeWindow window,
+                   ParseReclaimWindow(sql, absl::Now()));
+  const bool delete_rows = ParseReclaimDeleteRows(sql);
+  // An unbounded destructive sweep would erase every live row in scope, which
+  // is never what a harness means. Require a bound rather than doing it.
+  if (delete_rows && !window.not_before.has_value() &&
+      !window.not_after.has_value()) {
+    return error::InvalidArgument(
+        "EMULATOR_RECLAIM: delete_rows requires not_before, not_after or "
+        "not_after_lag -- refusing to erase every live row");
+  }
   GOOGLESQL_ASSIGN_OR_RETURN(backend::Database::ReclaimStats stats,
                    session->database()->backend()->ReclaimStorage(
-                       ParseReclaimTableNames(sql)));
+                       ParseReclaimTableNames(sql), window, delete_rows));
 
   auto* row_type = response->mutable_metadata()->mutable_row_type();
   auto* rows_field = row_type->add_fields();
@@ -273,10 +385,14 @@ absl::Status HandleEmulatorReclaim(std::shared_ptr<Session> session,
   auto* versions_field = row_type->add_fields();
   versions_field->set_name("versions_purged");
   versions_field->mutable_type()->set_code(google::spanner::v1::TypeCode::INT64);
+  auto* deleted_field = row_type->add_fields();
+  deleted_field->set_name("rows_deleted");
+  deleted_field->mutable_type()->set_code(google::spanner::v1::TypeCode::INT64);
 
   auto* row = response->add_rows();
   row->add_values()->set_string_value(absl::StrCat(stats.rows_purged));
   row->add_values()->set_string_value(absl::StrCat(stats.versions_purged));
+  row->add_values()->set_string_value(absl::StrCat(stats.rows_deleted));
   return absl::OkStatus();
 }
 

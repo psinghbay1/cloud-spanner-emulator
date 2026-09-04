@@ -8,6 +8,22 @@
 #   ./reclaim.sh --list                       # list databases, do nothing
 #   ./reclaim.sh --retention 1s mydb          # shorten the window first, then sweep
 #
+# Seeded databases -- protect the seed data and the newest writes:
+#   ./reclaim.sh --all --not-before "$SEED_DONE" --not-after-lag 60s
+#
+# --delete-rows additionally erases LIVE rows whose commit timestamp falls inside
+# the window -- rows a test inserted and never deleted. The sweeps above only
+# reclaim garbage, so on a seeded database this is what actually frees the bulk
+# of the memory. It is destructive and requires a bound:
+#   ./reclaim.sh --all --not-before "$SEED_DONE" --not-after-lag 60s --delete-rows
+#
+# --not-before protects everything written at or before that instant: seed data
+# is the oldest data present, so a plain sweep reaches it first. --not-after-lag
+# holds back the newest writes, so an in-flight test never loses rows underneath
+# it. Together they purge only churn in between. Neither needs --retention: they
+# bound the sweep directly, leaving version_retention_period (and therefore
+# stale reads) alone.
+#
 # Environment (all optional):
 #   EMULATOR_REST   host:port of the REST gateway   (default localhost:9020)
 #   PROJECT         project id                      (default bay1-pj-lab-eng)
@@ -26,6 +42,9 @@ BASE="http://${REST}/v1"
 PREFIX="projects/${PROJECT}/instances/${INSTANCE}/databases"
 
 RETENTION=""
+NOT_BEFORE=""
+NOT_AFTER_LAG=""
+DELETE_ROWS=false
 ALL=false
 LIST=false
 
@@ -34,13 +53,22 @@ while [[ $# -gt 0 ]]; do
     --all)       ALL=true; shift ;;
     --list)      LIST=true; shift ;;
     --retention) RETENTION="$2"; shift 2 ;;
-    -h|--help)   sed -n '2,22p' "$0"; exit 0 ;;
+    --not-before) NOT_BEFORE="$2"; shift 2 ;;
+    --not-after-lag) NOT_AFTER_LAG="$2"; shift 2 ;;
+    --delete-rows) DELETE_ROWS=true; shift ;;
+    -h|--help)   sed -n '2,33p' "$0"; exit 0 ;;
     --*)         echo "unknown flag: $1" >&2; exit 1 ;;
     *)           break ;;
   esac
 done
 
 die() { echo "error: $*" >&2; exit 1; }
+
+# Erasing live rows with no bound would empty the database. The emulator
+# rejects this too; failing here gives a clearer message.
+if [[ "$DELETE_ROWS" == true && -z "$NOT_BEFORE" && -z "$NOT_AFTER_LAG" ]]; then
+  die "--delete-rows needs --not-before and/or --not-after-lag (refusing to erase every live row)"
+fi
 
 api() {  # api METHOD PATH [JSON]
   local method="$1" path="$2" body="${3:-}"
@@ -81,6 +109,7 @@ fi
 
 total_rows=0
 total_versions=0
+total_deleted=0
 
 for database in "${DATABASES[@]}"; do
   # Nothing older than version_retention_period is eligible, and the default is
@@ -102,6 +131,15 @@ print(payload["name"])')" || die "database \"${database}\" not found on ${PROJEC
 
   args=""
   for table in ${TABLES+"${TABLES[@]}"}; do args+="${args:+, }'${table}'"; done
+  if [[ -n "$NOT_BEFORE" ]]; then
+    args+="${args:+, }not_before => '${NOT_BEFORE}'"
+  fi
+  if [[ -n "$NOT_AFTER_LAG" ]]; then
+    args+="${args:+, }not_after_lag => '${NOT_AFTER_LAG}'"
+  fi
+  if [[ "$DELETE_ROWS" == true ]]; then
+    args+="${args:+, }delete_rows => true"
+  fi
 
   response="$(api POST "${session}:executeSql" \
     "{\"sql\":\"SELECT EMULATOR_RECLAIM(${args})\"}")"
@@ -115,18 +153,21 @@ if "rows" not in payload:
     sys.exit("reclaim failed: " + message +
              "\n       (a stock emulator rejects EMULATOR_RECLAIM; this needs the fork build)")
 row = payload["rows"][0]
-print(row[0], row[1])')" || exit 1
-  read -r rows versions <<< "$parsed"
+print(row[0], row[1], row[2] if len(row) > 2 else 0)')" || exit 1
+  read -r rows versions deleted <<< "$parsed"
 
   scope="whole database"
   [[ ${#TABLES[@]} -gt 0 ]] && scope="${#TABLES[@]} table(s)"
-  printf '%-28s %10s rows  %10s versions   (%s)\n' "$database" "$rows" "$versions" "$scope"
+  printf '%-28s %10s rows  %10s versions  %10s deleted   (%s)\n' \
+    "$database" "$rows" "$versions" "$deleted" "$scope"
   total_rows=$(( total_rows + rows ))
   total_versions=$(( total_versions + versions ))
+  total_deleted=$(( total_deleted + deleted ))
 done
 
 if [[ ${#DATABASES[@]} -gt 1 ]]; then
-  printf '%-28s %10s rows  %10s versions   (total)\n' "" "$total_rows" "$total_versions"
+  printf '%-28s %10s rows  %10s versions  %10s deleted   (total)\n' \
+    "" "$total_rows" "$total_versions" "$total_deleted"
 fi
 
 cat <<EOF

@@ -1029,6 +1029,203 @@ TEST_F(InMemoryStorageTest, PurgeRemovesOnlyExpiredRowsFromMixedTable) {
   EXPECT_FALSE(itr_->Next());
 }
 
+
+// Tests for the PurgeWindow bounds.
+//
+// A harness that seeds a database before a run needs the seed data to survive
+// reclamation. Seed data is the OLDEST data present, so an unbounded sweep
+// reaches it first -- these cover the bounds that prevent that.
+
+TEST_F(InMemoryStorageTest, PurgeKeepsSeedRowDeletedInsideWindow) {
+  storage_.SetVersionRetentionPeriod(absl::Seconds(1));
+  absl::Time now = absl::Now();
+  absl::Time seed_done = now - absl::Minutes(30);
+
+  // Seeded before the run, then deleted by a test during it. Without the seed
+  // guard the tombstone alone would make this row purgeable.
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(40), kTableId0,
+                           Key({Int64(1)}), {kColumnID}, {Bool(true)}));
+  GOOGLESQL_EXPECT_OK(storage_.Delete(now - absl::Minutes(10), kTableId0,
+                            KeyRange::Point(Key({Int64(1)}))));
+
+  PurgeWindow window;
+  window.not_before = seed_done;
+  EXPECT_EQ(storage_.PurgeExpiredDeletedRows(now, {}, window), 0);
+
+  // Without the bound the same row is purgeable, proving the guard did it.
+  EXPECT_EQ(storage_.PurgeExpiredDeletedRows(now, {}), 1);
+}
+
+TEST_F(InMemoryStorageTest, PurgeRemovesRowCreatedAfterNotBefore) {
+  storage_.SetVersionRetentionPeriod(absl::Seconds(1));
+  absl::Time now = absl::Now();
+  absl::Time seed_done = now - absl::Minutes(30);
+
+  // Written and deleted entirely inside the window: this is run churn.
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(20), kTableId0,
+                           Key({Int64(2)}), {kColumnID}, {Bool(true)}));
+  GOOGLESQL_EXPECT_OK(storage_.Delete(now - absl::Minutes(10), kTableId0,
+                            KeyRange::Point(Key({Int64(2)}))));
+
+  PurgeWindow window;
+  window.not_before = seed_done;
+  EXPECT_EQ(storage_.PurgeExpiredDeletedRows(now, {}, window), 1);
+}
+
+TEST_F(InMemoryStorageTest, PurgeKeepsRowDeletedInsideNotAfterLag) {
+  storage_.SetVersionRetentionPeriod(absl::Seconds(1));
+  absl::Time now = absl::Now();
+
+  // Deleted 30s ago; a one-minute lag must hold it back even though the
+  // retention period alone would allow the sweep.
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(10), kTableId0,
+                           Key({Int64(3)}), {kColumnID}, {Bool(true)}));
+  GOOGLESQL_EXPECT_OK(storage_.Delete(now - absl::Seconds(30), kTableId0,
+                            KeyRange::Point(Key({Int64(3)}))));
+
+  PurgeWindow window;
+  window.not_after = now - absl::Minutes(1);
+  EXPECT_EQ(storage_.PurgeExpiredDeletedRows(now, {}, window), 0);
+}
+
+TEST_F(InMemoryStorageTest, PurgeVersionsKeepsSeedVersionOfLiveRow) {
+  storage_.SetVersionRetentionPeriod(absl::Seconds(1));
+  absl::Time now = absl::Now();
+  absl::Time seed_done = now - absl::Minutes(30);
+
+  // One seed version plus two written during the run. The seed version must
+  // survive; the superseded in-window version is reclaimable.
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(40), kTableId0,
+                           Key({Int64(4)}), {kColumnID}, {Bool(true)}));
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(20), kTableId0,
+                           Key({Int64(4)}), {kColumnID}, {Bool(false)}));
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(10), kTableId0,
+                           Key({Int64(4)}), {kColumnID}, {Bool(true)}));
+
+  PurgeWindow window;
+  window.not_before = seed_done;
+  storage_.PurgeExpiredVersions(now, {}, window);
+
+  // The seed version is still readable at a timestamp inside the seed era.
+  std::vector<googlesql::Value> values;
+  GOOGLESQL_EXPECT_OK(storage_.Lookup(now - absl::Minutes(35), kTableId0,
+                            Key({Int64(4)}), {kColumnID}, &values));
+  EXPECT_THAT(values, testing::ElementsAre(Bool(true)));
+}
+
+TEST_F(InMemoryStorageTest, PurgeWindowLeavesRetentionBehaviourUnchanged) {
+  storage_.SetVersionRetentionPeriod(absl::Seconds(1));
+  absl::Time now = absl::Now();
+
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(10), kTableId0,
+                           Key({Int64(5)}), {kColumnID}, {Bool(true)}));
+  GOOGLESQL_EXPECT_OK(storage_.Delete(now - absl::Minutes(8), kTableId0,
+                            KeyRange::Point(Key({Int64(5)}))));
+
+  // An empty window is the documented default: same result as no window.
+  EXPECT_EQ(storage_.PurgeExpiredDeletedRows(now, {}, PurgeWindow{}), 1);
+}
+
+
+// Tests for DeleteRowsInWindow -- the opt-in destructive sweep.
+//
+// This erases LIVE rows, so its bounds are the only thing standing between a
+// harness and its seed data. Each bound is covered on both sides.
+
+TEST_F(InMemoryStorageTest, DeleteRowsInWindowKeepsSeedRow) {
+  absl::Time now = absl::Now();
+  absl::Time seed_done = now - absl::Minutes(30);
+
+  // Committed before seeding finished: must survive.
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(40), kTableId0,
+                           Key({Int64(1)}), {kColumnID}, {Bool(true)}));
+
+  PurgeWindow window;
+  window.not_before = seed_done;
+  window.not_after = now - absl::Minutes(1);
+  EXPECT_EQ(storage_.DeleteRowsInWindow(now, {}, window), 0);
+
+  std::vector<googlesql::Value> values;
+  GOOGLESQL_EXPECT_OK(
+      storage_.Lookup(now, kTableId0, Key({Int64(1)}), {kColumnID}, &values));
+  EXPECT_THAT(values, testing::ElementsAre(Bool(true)));
+}
+
+TEST_F(InMemoryStorageTest, DeleteRowsInWindowRemovesTestRow) {
+  absl::Time now = absl::Now();
+
+  // Committed inside the window: this is test churn and is erased even though
+  // it is live and was never deleted by the application.
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(20), kTableId0,
+                           Key({Int64(2)}), {kColumnID}, {Bool(true)}));
+
+  PurgeWindow window;
+  window.not_before = now - absl::Minutes(30);
+  window.not_after = now - absl::Minutes(1);
+  EXPECT_EQ(storage_.DeleteRowsInWindow(now, {}, window), 1);
+
+  std::vector<googlesql::Value> values;
+  EXPECT_FALSE(
+      storage_.Lookup(now, kTableId0, Key({Int64(2)}), {kColumnID}, &values)
+          .ok());
+}
+
+TEST_F(InMemoryStorageTest, DeleteRowsInWindowKeepsRowInsideNotAfterLag) {
+  absl::Time now = absl::Now();
+
+  // Committed 30s ago, inside the one-minute hold-back: a running test may
+  // still be reading it.
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Seconds(30), kTableId0,
+                           Key({Int64(3)}), {kColumnID}, {Bool(true)}));
+
+  PurgeWindow window;
+  window.not_before = now - absl::Minutes(30);
+  window.not_after = now - absl::Minutes(1);
+  EXPECT_EQ(storage_.DeleteRowsInWindow(now, {}, window), 0);
+}
+
+TEST_F(InMemoryStorageTest, DeleteRowsInWindowUsesCommitTimestampOfInsert) {
+  absl::Time now = absl::Now();
+
+  // Seeded before the boundary, then UPDATED inside the window. The row is
+  // still seed data: the insert's commit timestamp decides, not the update's.
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(40), kTableId0,
+                           Key({Int64(4)}), {kColumnID}, {Bool(true)}));
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(10), kTableId0,
+                           Key({Int64(4)}), {kColumnID}, {Bool(false)}));
+
+  PurgeWindow window;
+  window.not_before = now - absl::Minutes(30);
+  window.not_after = now - absl::Minutes(1);
+  EXPECT_EQ(storage_.DeleteRowsInWindow(now, {}, window), 0);
+}
+
+TEST_F(InMemoryStorageTest, DeleteRowsInWindowScopedToNamedTablesOnly) {
+  absl::Time now = absl::Now();
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(20), kTableId0,
+                           Key({Int64(5)}), {kColumnID}, {Bool(true)}));
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(20), kTableId1,
+                           Key({Int64(5)}), {kColumnID}, {Bool(true)}));
+
+  PurgeWindow window;
+  window.not_before = now - absl::Minutes(30);
+  window.not_after = now - absl::Minutes(1);
+  EXPECT_EQ(storage_.DeleteRowsInWindow(now, {kTableId0}, window), 1);
+  EXPECT_EQ(storage_.DeleteRowsInWindow(now, {kTableId1}, window), 1);
+}
+
+TEST_F(InMemoryStorageTest, DeleteRowsInWindowIsIdempotent) {
+  absl::Time now = absl::Now();
+  GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(20), kTableId0,
+                           Key({Int64(6)}), {kColumnID}, {Bool(true)}));
+
+  PurgeWindow window;
+  window.not_before = now - absl::Minutes(30);
+  window.not_after = now - absl::Minutes(1);
+  EXPECT_EQ(storage_.DeleteRowsInWindow(now, {}, window), 1);
+  EXPECT_EQ(storage_.DeleteRowsInWindow(now, {}, window), 0);
+}
+
 }  // namespace
 
 }  // namespace backend

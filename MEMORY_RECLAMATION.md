@@ -391,3 +391,91 @@ The `DROP INDEX` fix (`schema_updater.cc`) is an unambiguous upstream defect and
 should be sent as its own PR. `malloc_trim` is one guarded line and would benefit
 every emulator user. Landing both upstream would leave this fork carrying only the
 purge methods and the SQL trigger.
+
+## Bounded reclamation for seeded databases
+
+A harness that seeds a database before a run needs the seed data to survive
+reclamation. Seed data is the **oldest** data present, so an unbounded sweep
+reaches it first. Two optional bounds fix that, and a third flag turns on
+destructive removal of live test rows.
+
+### The bounds
+
+| Argument | Meaning |
+|---|---|
+| `not_before` | Nothing committed at or before this instant is touched. Set it to the moment seeding finished. |
+| `not_after` | Absolute upper bound. |
+| `not_after_lag` | Upper bound relative to now, e.g. `'60s'`. Preferred for a long run: the newest writes stay safe however long the suite takes. |
+| `delete_rows` | **Destructive.** Also erase live rows whose commit timestamp falls in the window. |
+
+Selection uses the row's **commit timestamp** — the one the engine assigns in
+`ReserveCommitTimestamp()` and writes through `flush.cc`. It is not the value of
+a user-defined `commit_timestamp` column: that requires `allow_commit_timestamp`
+in the DDL and the application writing `PENDING_COMMIT_TIMESTAMP()`, so most
+tables would be skipped. For a row inserted and later updated, the **insert**
+timestamp decides, which is what keeps an updated seed row classified as seed.
+
+### What each sweep reclaims
+
+Three different things hold memory, and only the third needs the opt-in flag:
+
+| Source | Reclaimed by | Counter |
+|---|---|---|
+| Tombstones of rows the client deleted | `PurgeExpiredDeletedRows` | `rows_purged` |
+| Superseded versions of live rows | `PurgeExpiredVersions` | `versions_purged` |
+| **Live rows a test inserted and never deleted** | `DeleteRowsInWindow` (opt-in) | `rows_deleted` |
+
+On a seeded database the third is usually most of the memory: a client `DELETE`
+only appends an `_exists=false` tombstone and keeps every version, so it *grows*
+the heap. `DeleteRowsInWindow` erases the map entry outright — record, version
+history and tombstone together — so there is nothing left to sweep afterwards.
+It runs first for that reason.
+
+### Usage
+
+```bash
+SEED_DONE=$(date -u +%Y-%m-%dT%H:%M:%SZ)   # capture after seeding completes
+
+# Non-destructive: reclaim garbage only, protecting seed data and the last minute.
+./reclaim.sh --all --not-before "$SEED_DONE" --not-after-lag 60s
+
+# Destructive: also drop live rows the tests created inside the window.
+./reclaim.sh --all --not-before "$SEED_DONE" --not-after-lag 60s --delete-rows
+```
+
+Equivalent SQL:
+
+```sql
+SELECT EMULATOR_RECLAIM(not_before => '2026-09-03T19:00:00Z',
+                        not_after_lag => '60s',
+                        delete_rows => true)
+```
+
+Table names may be mixed in to scope the sweep:
+
+```sql
+SELECT EMULATOR_RECLAIM('Orders', 'LineItems', not_after_lag => '60s')
+```
+
+### Guards
+
+`delete_rows` with no bound is **refused** by both `reclaim.sh` and the
+emulator — unbounded it would erase every live row in scope.
+
+Note that these bounds do not need `--retention`. Shortening
+`version_retention_period` is a schema change that breaks stale reads and is
+never restored by the script; the bounds constrain the sweep directly and leave
+retention alone. `--retention` is kept for the simple case where no seed data
+needs protecting.
+
+### Verifying
+
+```bash
+docker logs <container> 2>&1 | grep '\[reclaim\]'
+docker stats --no-stream --format '{{.MemUsage}}' <container>
+```
+
+The `[reclaim]` line samples the heap three times — before, after purge, after
+`malloc_trim` — because "the engine freed it" and "the OS got it back" are
+different questions.
+
