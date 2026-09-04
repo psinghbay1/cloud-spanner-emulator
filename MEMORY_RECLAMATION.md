@@ -106,7 +106,8 @@ data is the **oldest** data present, so an unbounded sweep reaches it *first*.
 SEED_DONE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 # Then, between test batches:
-./reclaim.sh --all --not-before "$SEED_DONE" --not-after-lag 60s --delete-rows
+./reclaim.sh --all --not-before "$SEED_DONE" --not-after-lag 60s \
+             --delete-rows --prune-sessions
 ```
 
 Each row is kept or erased by the commit timestamp of its insert:
@@ -121,20 +122,22 @@ Both bounds matter. Without `--not-before` the sweep deletes the seed data;
 without `--not-after-lag` it can delete rows out from under a test that is still
 running. `--delete-rows` is what frees memory held by **live** rows a test
 inserted and never deleted, which on a seeded database is most of it — the other
-sweeps only reclaim garbage.
+sweeps only reclaim garbage. `--prune-sessions` releases sessions the run
+abandoned, which the row sweeps cannot reach: sessions are frontend state, and
+their expiry never fires for a session nobody looks up again.
 
 Drop `--delete-rows` for a non-destructive run that reclaims tombstones and
 superseded versions but never removes a live row:
 
 ```bash
-./reclaim.sh --all --not-before "$SEED_DONE" --not-after-lag 60s
+./reclaim.sh --all --not-before "$SEED_DONE" --not-after-lag 60s --prune-sessions
 ```
 
 To limit the blast radius further, name the churn tables explicitly — seed
 tables are then untouched by construction:
 
 ```bash
-./reclaim.sh mydb Orders Events --not-after-lag 60s --delete-rows
+./reclaim.sh mydb Orders Events --not-after-lag 60s --delete-rows --prune-sessions
 ```
 
 Note this is a full scan of every row in every table in scope. Run it between
@@ -149,7 +152,8 @@ SELECT EMULATOR_RECLAIM('Orders', 'LineItems');  -- scoped; also sweeps their in
 SELECT EMULATOR_RECLAIM();                       -- whole database
 SELECT EMULATOR_RECLAIM(not_before => '2026-09-03T19:00:00Z',
                         not_after_lag => '60s',
-                        delete_rows => true);    -- seeded database
+                        delete_rows => true,
+                        prune_sessions => true); -- seeded database
 ```
 
 Returns one row:
