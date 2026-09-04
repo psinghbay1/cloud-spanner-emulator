@@ -1390,11 +1390,15 @@ TEST_P(QueryApiTest, EmulatorReclaimReturnsCounters) {
                                     name: "sessions_pruned"
                                     type { code: INT64 }
                                   }
+                                  fields {
+                                    name: "operations_pruned"
+                                    type { code: INT64 }
+                                  }
                                 }
                               }
                             )pb")));
   ASSERT_EQ(response.rows_size(), 1);
-  EXPECT_EQ(response.rows(0).values_size(), 4);
+  EXPECT_EQ(response.rows(0).values_size(), 5);
 }
 
 // Table names still parse now that named arguments share the argument list.
@@ -1549,9 +1553,9 @@ TEST_P(QueryApiTest, EmulatorReclaimPrunesSessions) {
   spanner_api::ResultSet response;
   GOOGLESQL_ASSERT_OK(ExecuteSql(request, &response));
   ASSERT_EQ(response.rows_size(), 1);
-  // Four counters now: rows_purged, versions_purged, rows_deleted,
-  // sessions_pruned.
-  EXPECT_EQ(response.rows(0).values_size(), 4);
+  // Five counters: rows_purged, versions_purged, rows_deleted,
+  // sessions_pruned, operations_pruned.
+  EXPECT_EQ(response.rows(0).values_size(), 5);
 }
 
 }  // namespace
