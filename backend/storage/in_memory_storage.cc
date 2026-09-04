@@ -359,15 +359,9 @@ int64_t InMemoryStorage::PurgeExpiredVersions(
   return erased;
 }
 
-namespace {
-
-// True when a row's creation falls strictly inside the window. Shared by the
-// destructive sweep and its preview so the two can never disagree about what
-// qualifies.
-bool RowCreatedInWindow(const InMemoryStorage::Row& row,
-                        const PurgeWindow& window,
-                        absl::string_view exists_column) {
-  auto cell_itr = row.find(exists_column);
+bool InMemoryStorage::RowCreatedInWindow(const Row& row,
+                                         const PurgeWindow& window) {
+  auto cell_itr = row.find(kExistsColumn);
   if (cell_itr == row.end() || cell_itr->second.empty()) {
     return false;
   }
@@ -382,8 +376,6 @@ bool RowCreatedInWindow(const InMemoryStorage::Row& row,
   return true;
 }
 
-}  // namespace
-
 int64_t InMemoryStorage::CountRowsInWindow(
     absl::Time timestamp, const std::vector<TableID>& table_ids,
     const PurgeWindow& window) {
@@ -392,7 +384,7 @@ int64_t InMemoryStorage::CountRowsInWindow(
   int64_t matched = 0;
   auto count_table = [&](const Table& table) {
     for (const auto& [_, row] : table) {
-      if (RowCreatedInWindow(row, window, kExistsColumn)) {
+      if (RowCreatedInWindow(row, window)) {
         ++matched;
       }
     }
@@ -422,7 +414,7 @@ int64_t InMemoryStorage::DeleteRowsInWindow(
   // only sound for a local harness reclaiming between test batches, which is
   // why nothing calls it unless the caller asks by name.
   auto is_in_window = [&](const Row& row) {
-    return RowCreatedInWindow(row, window, kExistsColumn);
+    return RowCreatedInWindow(row, window);
   };
 
   int64_t erased = 0;

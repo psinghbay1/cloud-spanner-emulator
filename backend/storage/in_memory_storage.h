@@ -106,6 +106,11 @@ class InMemoryStorage : public Storage {
  private:
   using Cell = std::map<absl::Time, googlesql::Value>;
   using Row = absl::flat_hash_map<ColumnID, Cell>;
+
+  // True when a row's creation falls strictly inside the window. Shared by the
+  // destructive sweep and its preview so the two cannot disagree about what
+  // qualifies.
+  static bool RowCreatedInWindow(const Row& row, const PurgeWindow& window);
   using Table = std::map<Key, Row>;
   using Tables = absl::flat_hash_map<TableID, Table>;
 
