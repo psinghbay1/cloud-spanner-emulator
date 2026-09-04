@@ -677,6 +677,13 @@ destructive removal of live test rows.
 | `not_after_lag` | Upper bound relative to now, e.g. `'60s'`. Preferred for a long run: the newest writes stay safe however long the suite takes. |
 | `delete_rows` | **Destructive.** Also erase live rows whose commit timestamp falls in the window. |
 
+> **A reused primary key keeps its original creation time.** A row's age is the
+> timestamp of its *first* `_exists` version, so re-inserting a key that existed
+> earlier in the process makes the new row inherit the old row's age. It is then
+> classified by when the key was *first* seen, not by the current insert. This
+> only bites when a harness recycles primary keys within one emulator lifetime;
+> a sweep with `--delete-rows` erases the key outright, which resets it.
+
 Selection uses the row's **commit timestamp** — the one the engine assigns in
 `ReserveCommitTimestamp()` and writes through `flush.cc`. It is not the value of
 a user-defined `commit_timestamp` column: that requires `allow_commit_timestamp`

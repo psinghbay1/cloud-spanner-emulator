@@ -49,19 +49,20 @@ def patch(root, path, payload):
     urllib.request.urlopen(request, timeout=900)
 
 
-def write_rows(root, session, start, end, pad, batch_size=250):
+def write_rows(root, session, start, end, pad, table="T", batch_size=250):
     """Insert rows [start, end) in batches, as main() does."""
     for offset in range(start, end, batch_size):
         limit = min(offset + batch_size, end)
         post(root, f"{session}:commit", {
             "singleUseTransaction": {"readWrite": {}},
             "mutations": [{"insertOrUpdate": {
-                "table": "T", "columns": ["id", "a", "b"],
+                "table": table, "columns": ["id", "a", "b"],
                 "values": [[str(k), pad, pad] for k in range(offset, limit)]}}]})
 
 
-def count_rows(root, session):
-    result = post(root, f"{session}:executeSql", {"sql": "SELECT COUNT(*) FROM T"})
+def count_rows(root, session, table="T"):
+    result = post(root, f"{session}:executeSql",
+                  {"sql": f"SELECT COUNT(*) FROM {table}"})
     return result["rows"][0][0]
 
 
@@ -142,26 +143,35 @@ def main():
     # checks it against a real emulator rather than only in unit tests.
     print()
     print("  Seeded-database bounds")
+    # A fresh table. Reusing T would reuse row keys that scenario 1 already
+    # inserted, and a row's creation time is the FIRST _exists version -- which
+    # would be scenario 1's write, not the seed write, making every seeded row
+    # look like churn.
+    patch(root, f"{databases}/{DATABASE}/ddl", {"statements": [
+        "CREATE TABLE Seeded (id INT64 NOT NULL, a STRING(MAX), b STRING(MAX)) "
+        "PRIMARY KEY (id)"]})
+
     seed_rows = 500
-    write_rows(root, session, 0, seed_rows, "S")
+    write_rows(root, session, 0, seed_rows, "S", table="Seeded")
     seed_done = now_rfc3339()
     time.sleep(2)  # let the seed rows age past the boundary
-    write_rows(root, session, seed_rows, seed_rows + 500, "T")
+    write_rows(root, session, seed_rows, seed_rows + 500, "T", table="Seeded")
 
-    before = int(count_rows(root, session))
+    before = int(count_rows(root, session, table="Seeded"))
     reclaimed = post(root, f"{session}:executeSql", {
         "sql": ("SELECT EMULATOR_RECLAIM("
-                f"not_before => '{seed_done}', delete_rows => true)")})
+                f"'Seeded', not_before => '{seed_done}', delete_rows => true)")})
     deleted = int(reclaimed["rows"][0][2])
-    after = int(count_rows(root, session))
+    after = int(count_rows(root, session, table="Seeded"))
 
     print(f"    rows before sweep       : {before}")
     print(f"    rows deleted            : {deleted}")
     print(f"    rows remaining          : {after}")
 
-    if after < seed_rows:
-        print(f"    FAIL: only {after} rows left; the {seed_rows} seeded rows")
-        print("          must survive a sweep bounded by not_before.")
+    if after != seed_rows:
+        print(f"    FAIL: {after} rows left, expected exactly {seed_rows};")
+        print("          the seeded rows must survive a not_before-bounded sweep")
+        print("          and the rows written after it must not.")
         return 1
     if deleted == 0:
         print("    FAIL: nothing was deleted; rows written after the boundary")
