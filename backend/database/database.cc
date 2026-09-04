@@ -33,6 +33,9 @@
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/log/log.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -64,6 +67,28 @@ namespace google {
 namespace spanner {
 namespace emulator {
 namespace backend {
+
+namespace {
+
+// Bytes currently handed out by the allocator. glibc-specific; other platforms
+// report 0, which the log renders as a zero delta rather than a wrong number.
+int64_t HeapBytesInUse() {
+#ifdef __GLIBC__
+  // mallinfo2 is the 64-bit-safe form; mallinfo() truncates above 2 GB, which
+  // is exactly the range this logging exists to observe.
+  struct mallinfo2 info = mallinfo2();
+  return static_cast<int64_t>(info.uordblks);
+#else
+  return 0;
+#endif
+}
+
+// Bytes as MiB, one decimal place, for log readability.
+double MiB(int64_t bytes) {
+  return static_cast<double>(bytes) / (1024.0 * 1024.0);
+}
+
+}  // namespace
 
 // TransactionIDGenerator is initialized to 1 because 0 is used as a sentinel
 // value for an invalid transaction.
@@ -246,6 +271,16 @@ absl::StatusOr<Database::ReclaimStats> Database::ReclaimStorage(
     }
   }
 
+  const std::string scope =
+      table_names.empty()
+          ? "whole database"
+          : absl::StrCat(table_names.size(), " table(s): ",
+                         absl::StrJoin(table_names, ", "));
+  ABSL_LOG(INFO) << "[reclaim] database=" << database_id_ << " start, scope=" << scope
+                 << ", resolved " << table_ids.size() << " storage table(s)";
+
+  const int64_t heap_before = HeapBytesInUse();
+
   ReclaimStats stats;
   stats.rows_purged = storage_->PurgeExpiredDeletedRows(now, table_ids);
   stats.versions_purged = storage_->PurgeExpiredVersions(now, table_ids);
@@ -256,12 +291,31 @@ absl::StatusOr<Database::ReclaimStats> Database::ReclaimStorage(
   storage_->CleanUpDeletedTables(now);
   storage_->CleanUpDeletedColumns(now);
 
+  const int64_t heap_after_purge = HeapBytesInUse();
+
 #ifdef __GLIBC__
   // Erasing from the storage maps returns nodes to the allocator's free lists,
   // not to the OS, so RSS does not drop on its own. Ask glibc to release what
   // it can; heap fragmentation limits how much is actually returnable.
   malloc_trim(0);
 #endif
+
+  const int64_t heap_after_trim = HeapBytesInUse();
+
+  // Logged so an operator can confirm from the container log that reclamation
+  // actually ran and what it recovered, without having to correlate against
+  // external RSS samples. heap_* is the allocator's own accounting: the purge
+  // delta shows what the engine freed, the trim delta what glibc handed back to
+  // the OS. The two are different questions and both matter.
+  ABSL_LOG(INFO) << "[reclaim] database=" << database_id_ << " done"
+                 << ", rows_purged=" << stats.rows_purged
+                 << ", versions_purged=" << stats.versions_purged
+                 << ", heap_before=" << MiB(heap_before) << " MiB"
+                 << ", after_purge=" << MiB(heap_after_purge) << " MiB"
+                 << " (freed " << MiB(heap_before - heap_after_purge) << " MiB)"
+                 << ", after_trim=" << MiB(heap_after_trim) << " MiB"
+                 << " (returned " << MiB(heap_after_purge - heap_after_trim)
+                 << " MiB to the OS)";
 
   return stats;
 }

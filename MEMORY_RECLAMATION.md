@@ -130,7 +130,7 @@ background. Never write production code against it.
 ## Building
 
 ```bash
-./setup.sh          # one-time host checks: bazel, JDK, Docker build DNS
+./setup.sh          # one-time host checks: bazel, JDK, Docker build DNS, VM memory
 ./build.sh          # build //... then run the reclamation tests
 ./build.sh docker   # same, inside the upstream devcontainer image
 ./build_docker.sh --tag spanner-emulator-reclaim:dev --verify
@@ -138,6 +138,54 @@ background. Never write production code against it.
 
 `build.sh` modes: `build`, `test`, `all-tests`, `docker`, or no argument for
 build-then-test.
+
+`build_docker.sh` options:
+
+| Option | Effect |
+| --- | --- |
+| `--tag NAME` | image tag (default `spanner-emulator-fork:latest`) |
+| `--verify` | after building, run `verify_reclaim.py` against the image |
+| `--jobs N` | cap bazel parallelism by hand |
+| `--no-low-memory` | opt out of the aggressive GCC garbage collection (on by default) |
+
+### Verifying reclamation
+
+Two harnesses, both measuring **container RSS** — the only measure that settles
+whether memory actually came back:
+
+```bash
+# Single write/delete/reclaim cycle. Fast; run as part of the build.
+./build_docker.sh --tag spanner-emulator-reclaim:dev --verify
+
+# All seven scenarios, comparable between images.
+python3 benchmark_reclaim.py --image gcr.io/cloud-spanner-emulator/emulator:1.5.55
+python3 benchmark_reclaim.py --image spanner-emulator-reclaim:dev --reclaim
+```
+
+`benchmark_reclaim.py` runs mutation delete, DML delete, `DROP TABLE`,
+`DROP DATABASE`, `DELETE INSTANCE`, `DROP INDEX` and a container restart,
+sampling RSS around each. Run it against the stock image first for a baseline,
+then against a fork build with `--reclaim`; the numbers are directly comparable
+because it is the same script and the same container memory cap.
+
+### Reclamation logging
+
+Every `ReclaimStorage()` call logs to the container log, so an operator can
+confirm from `docker logs` that reclamation ran and what it recovered:
+
+```
+[reclaim] database=issuance start, scope=2 table(s): AqPayment, TxLedgerEntry,
+          resolved 5 storage table(s)
+[reclaim] database=issuance done, rows_purged=41233, versions_purged=8817,
+          heap_before=184.5 MiB, after_purge=61.2 MiB (freed 123.3 MiB),
+          after_trim=48.7 MiB (returned 12.5 MiB to the OS)
+```
+
+Heap figures come from `mallinfo2()`, sampled at three points. The two deltas
+answer different questions and both matter: **freed** is what the engine
+released into the allocator, **returned** is what glibc handed back to the OS.
+A large `freed` with a small `returned` means the engine fix works and the
+allocator is holding the pages.
 
 ### Why `setup.sh` exists
 
@@ -163,8 +211,27 @@ gcc: fatal error: Killed signal terminated program cc1plus
 ResourceExhausted: cannot allocate memory
 ```
 
-`build_docker.sh` reads the VM's actual memory and CPU count and budgets one job
-per 2 GB. Override with `--jobs N` or `BAZEL_JOBS=N`.
+`build_docker.sh` reads the VM's actual memory and CPU count and budgets **one job
+per 4 GB**. Override with `--jobs N` or `BAZEL_JOBS=N`.
+
+Budgeting per-average rather than per-peak is a trap worth naming: at 2 GB/job a
+31 GiB VM computes `--jobs=15`, and those fifteen peers consume exactly the
+headroom `tm_parser.cc` needs. Raising VM memory then makes things *worse*, not
+better, because the formula spends it on more concurrency.
+
+Low-memory mode is **on by default** and adds:
+
+```
+--param=ggc-min-expand=10        collect once the heap grows 10% (default ~100%)
+--param=ggc-min-heapsize=32768   start collecting from 32 MB
+-fno-var-tracking                skip costly debug-location tracking
+-fno-var-tracking-assignments
+```
+
+These make GCC's garbage collector run far more aggressively, cutting peak RSS
+at roughly 10-20% more compile time. Unlike lowering `-O` they do **not** change
+the generated code, which is why they are preferred over `-O0` on the offending
+file. Disable with `--no-low-memory`.
 
 ### Platform support
 
@@ -187,7 +254,8 @@ MEMORY_RECLAMATION.md        this file
 setup.sh                     one-time host setup
 build.sh                     build + test (native or devcontainer)
 build_docker.sh              build the container image
-verify_reclaim.py            end-to-end RSS check
+verify_reclaim.py            single-cycle RSS check (used by --verify)
+benchmark_reclaim.py         seven-scenario RSS benchmark, comparable between images
 
 backend/storage/
   storage.h                  + PurgeExpiredDeletedRows, PurgeExpiredVersions
