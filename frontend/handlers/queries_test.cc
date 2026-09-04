@@ -1362,8 +1362,9 @@ TEST_P(QueryApiTest, DirectedReadsWithRWTxnFails) {
 
 // The statement answers with three INT64 counters.
 TEST_P(QueryApiTest, EmulatorReclaimReturnsCounters) {
-  spanner_api::ExecuteSqlRequest request = PARSE_TEXT_PROTO(
-      R"(sql: "SELECT EMULATOR_RECLAIM()")");
+  spanner_api::ExecuteSqlRequest request;
+  request.set_sql(
+      "SELECT EMULATOR_RECLAIM()");
   request.set_session(
       GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
 
@@ -1394,8 +1395,9 @@ TEST_P(QueryApiTest, EmulatorReclaimReturnsCounters) {
 
 // Table names still parse now that named arguments share the argument list.
 TEST_P(QueryApiTest, EmulatorReclaimAcceptsTableNames) {
-  spanner_api::ExecuteSqlRequest request = PARSE_TEXT_PROTO(
-      R"(sql: "SELECT EMULATOR_RECLAIM('test_table')")");
+  spanner_api::ExecuteSqlRequest request;
+  request.set_sql(
+      "SELECT EMULATOR_RECLAIM('test_table')");
   request.set_session(
       GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
 
@@ -1406,8 +1408,9 @@ TEST_P(QueryApiTest, EmulatorReclaimAcceptsTableNames) {
 
 // A table name mixed with named arguments: the splitter must keep them apart.
 TEST_P(QueryApiTest, EmulatorReclaimAcceptsTableNameWithNamedArguments) {
-  spanner_api::ExecuteSqlRequest request = PARSE_TEXT_PROTO(
-      R"(sql: "SELECT EMULATOR_RECLAIM('test_table', not_after_lag => '60s')")");
+  spanner_api::ExecuteSqlRequest request;
+  request.set_sql(
+      "SELECT EMULATOR_RECLAIM('test_table', not_after_lag => '60s')");
   request.set_session(
       GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
 
@@ -1418,8 +1421,9 @@ TEST_P(QueryApiTest, EmulatorReclaimAcceptsTableNameWithNamedArguments) {
 
 // The bounds are accepted and parsed rather than silently ignored.
 TEST_P(QueryApiTest, EmulatorReclaimAcceptsWindowBounds) {
-  spanner_api::ExecuteSqlRequest request = PARSE_TEXT_PROTO(
-      R"(sql: "SELECT EMULATOR_RECLAIM(not_before => '2020-01-01T00:00:00Z', not_after_lag => '60s')")");
+  spanner_api::ExecuteSqlRequest request;
+  request.set_sql(
+      "SELECT EMULATOR_RECLAIM(not_before => '2020-01-01T00:00:00Z', not_after_lag => '60s')");
   request.set_session(
       GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
 
@@ -1431,8 +1435,9 @@ TEST_P(QueryApiTest, EmulatorReclaimAcceptsWindowBounds) {
 // A malformed timestamp is rejected, not treated as "no bound". Accepting it
 // silently would purge everything the bound was meant to protect.
 TEST_P(QueryApiTest, EmulatorReclaimRejectsUnparseableTimestamp) {
-  spanner_api::ExecuteSqlRequest request = PARSE_TEXT_PROTO(
-      R"(sql: "SELECT EMULATOR_RECLAIM(not_before => 'not-a-timestamp')")");
+  spanner_api::ExecuteSqlRequest request;
+  request.set_sql(
+      "SELECT EMULATOR_RECLAIM(not_before => 'not-a-timestamp')");
   request.set_session(
       GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
 
@@ -1443,8 +1448,9 @@ TEST_P(QueryApiTest, EmulatorReclaimRejectsUnparseableTimestamp) {
 }
 
 TEST_P(QueryApiTest, EmulatorReclaimRejectsUnparseableDuration) {
-  spanner_api::ExecuteSqlRequest request = PARSE_TEXT_PROTO(
-      R"(sql: "SELECT EMULATOR_RECLAIM(not_after_lag => 'not-a-duration')")");
+  spanner_api::ExecuteSqlRequest request;
+  request.set_sql(
+      "SELECT EMULATOR_RECLAIM(not_after_lag => 'not-a-duration')");
   request.set_session(
       GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
 
@@ -1456,8 +1462,9 @@ TEST_P(QueryApiTest, EmulatorReclaimRejectsUnparseableDuration) {
 
 // An inverted window is a caller mistake, not an empty sweep.
 TEST_P(QueryApiTest, EmulatorReclaimRejectsInvertedWindow) {
-  spanner_api::ExecuteSqlRequest request = PARSE_TEXT_PROTO(
-      R"(sql: "SELECT EMULATOR_RECLAIM(not_before => '2030-01-01T00:00:00Z', not_after => '2020-01-01T00:00:00Z')")");
+  spanner_api::ExecuteSqlRequest request;
+  request.set_sql(
+      "SELECT EMULATOR_RECLAIM(not_before => '2030-01-01T00:00:00Z', not_after => '2020-01-01T00:00:00Z')");
   request.set_session(
       GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
 
@@ -1470,8 +1477,9 @@ TEST_P(QueryApiTest, EmulatorReclaimRejectsInvertedWindow) {
 // delete_rows erases live rows, so an unbounded request would empty the
 // database. It must be refused rather than obeyed.
 TEST_P(QueryApiTest, EmulatorReclaimRejectsUnboundedDeleteRows) {
-  spanner_api::ExecuteSqlRequest request = PARSE_TEXT_PROTO(
-      R"(sql: "SELECT EMULATOR_RECLAIM(delete_rows => true)")");
+  spanner_api::ExecuteSqlRequest request;
+  request.set_sql(
+      "SELECT EMULATOR_RECLAIM(delete_rows => true)");
   request.set_session(
       GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
 
@@ -1483,8 +1491,9 @@ TEST_P(QueryApiTest, EmulatorReclaimRejectsUnboundedDeleteRows) {
 
 // Bounded delete_rows is allowed.
 TEST_P(QueryApiTest, EmulatorReclaimAcceptsBoundedDeleteRows) {
-  spanner_api::ExecuteSqlRequest request = PARSE_TEXT_PROTO(
-      R"(sql: "SELECT EMULATOR_RECLAIM(not_before => '2020-01-01T00:00:00Z', delete_rows => true)")");
+  spanner_api::ExecuteSqlRequest request;
+  request.set_sql(
+      "SELECT EMULATOR_RECLAIM(not_before => '2020-01-01T00:00:00Z', delete_rows => true)");
   request.set_session(
       GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
 
@@ -1497,8 +1506,9 @@ TEST_P(QueryApiTest, EmulatorReclaimAcceptsBoundedDeleteRows) {
 // before not_before survive a destructive sweep. test_table is populated by the
 // fixture before the run, so it stands in for seed data here.
 TEST_P(QueryApiTest, EmulatorReclaimKeepsRowsCommittedBeforeNotBefore) {
-  spanner_api::ExecuteSqlRequest reclaim = PARSE_TEXT_PROTO(
-      R"(sql: "SELECT EMULATOR_RECLAIM(not_before => '2030-01-01T00:00:00Z', delete_rows => true)")");
+  spanner_api::ExecuteSqlRequest reclaim;
+  reclaim.set_sql(
+      "SELECT EMULATOR_RECLAIM(not_before => '2030-01-01T00:00:00Z', delete_rows => true)");
   reclaim.set_session(
       GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
   spanner_api::ResultSet reclaim_response;
