@@ -951,17 +951,22 @@ TEST_F(InMemoryStorageTest, PurgeIsIdempotent) {
 // while its own cell is being written, so those superseded versions are never
 // reclaimed on their own.
 TEST_F(InMemoryStorageTest, PurgeVersionsTrimsSupersededVersionsOfLiveRow) {
-  storage_.SetVersionRetentionPeriod(absl::Seconds(1));
+  // Write() trims each cell against its own timestamp, so the versions only
+  // survive the writes if the retention period covers the whole span. This is
+  // the gap PurgeExpiredVersions closes: a row written a few times and then
+  // left alone keeps every version, because nothing writes to it again.
+  storage_.SetVersionRetentionPeriod(absl::Hours(1));
   absl::Time now = absl::Now();
 
-  // Five writes to one cell, all well outside the retention window.
+  // Five writes to one cell, all inside the hour so Write() keeps them.
   for (int i = 10; i >= 6; --i) {
     GOOGLESQL_EXPECT_OK(storage_.Write(now - absl::Minutes(i), kTableId0,
                              Key({Int64(1)}), {kColumnID}, {Int64(i)}));
   }
 
-  // Four of the five versions are erased; the newest before the retention
-  // floor is kept so reads inside the window still resolve.
+  // Now shorten the window: the sweep erases four, keeping the newest version
+  // at or before the floor so reads inside the window still resolve.
+  storage_.SetVersionRetentionPeriod(absl::Seconds(1));
   EXPECT_EQ(storage_.PurgeExpiredVersions(now, {}), 4);
 
   std::vector<googlesql::Value> values;
@@ -989,7 +994,7 @@ TEST_F(InMemoryStorageTest, PurgeVersionsKeepsVersionsInsideRetentionWindow) {
 }
 
 TEST_F(InMemoryStorageTest, PurgeVersionsIsIdempotent) {
-  storage_.SetVersionRetentionPeriod(absl::Seconds(1));
+  storage_.SetVersionRetentionPeriod(absl::Hours(1));
   absl::Time now = absl::Now();
 
   for (int i = 10; i >= 8; --i) {
@@ -997,6 +1002,7 @@ TEST_F(InMemoryStorageTest, PurgeVersionsIsIdempotent) {
                              Key({Int64(1)}), {kColumnID}, {Int64(i)}));
   }
 
+  storage_.SetVersionRetentionPeriod(absl::Seconds(1));
   EXPECT_EQ(storage_.PurgeExpiredVersions(now, {}), 2);
   EXPECT_EQ(storage_.PurgeExpiredVersions(now, {}), 0);
 }
@@ -1089,7 +1095,9 @@ TEST_F(InMemoryStorageTest, PurgeKeepsRowDeletedInsideNotAfterLag) {
 }
 
 TEST_F(InMemoryStorageTest, PurgeVersionsKeepsSeedVersionOfLiveRow) {
-  storage_.SetVersionRetentionPeriod(absl::Seconds(1));
+  // A long window during the writes so Write() keeps every version; the sweep
+  // below is what decides which survive.
+  storage_.SetVersionRetentionPeriod(absl::Hours(1));
   absl::Time now = absl::Now();
   absl::Time seed_done = now - absl::Minutes(30);
 
