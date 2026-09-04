@@ -23,6 +23,7 @@ source "$SCRIPT_DIR/jdk_detect.sh"
 TEST_TARGETS=(
   "//backend/storage:in_memory_storage_test"
   "//backend/schema/updater:schema_updater_test"
+  "//frontend/handlers:queries_test"
 )
 
 VERBOSE=false
@@ -65,6 +66,19 @@ backend/storage/in_memory_storage_test.cc
     PurgeKeepsRowDeletedInsideNotAfterLag
     PurgeVersionsKeepsSeedVersionOfLiveRow
     PurgeWindowLeavesRetentionBehaviourUnchanged
+
+frontend/handlers/queries_test.cc
+  EMULATOR_RECLAIM -- the statement, end to end over gRPC
+    EmulatorReclaimReturnsCounters
+    EmulatorReclaimAcceptsTableNames
+    EmulatorReclaimAcceptsTableNameWithNamedArguments
+    EmulatorReclaimAcceptsWindowBounds
+    EmulatorReclaimRejectsUnparseableTimestamp
+    EmulatorReclaimRejectsUnparseableDuration
+    EmulatorReclaimRejectsInvertedWindow
+    EmulatorReclaimRejectsUnboundedDeleteRows
+    EmulatorReclaimAcceptsBoundedDeleteRows
+    EmulatorReclaimKeepsRowsCommittedBeforeNotBefore
 
 backend/schema/updater/schema_updater_test.cc
   Covers the DropIndex fix: an index's data table is now marked dropped so
