@@ -139,10 +139,6 @@ TEST_F(OperationManagerTest, ListsOperationsWithSimilarInstanceURI) {
             operation_pb.name());
 }
 
-}  // namespace frontend
-}  // namespace emulator
-}  // namespace spanner
-
 // PruneCompletedOperations -- reclaiming finished long-running operations.
 //
 // One operation is created for every CreateDatabase and UpdateDdl, and removed
@@ -203,5 +199,9 @@ TEST_F(OperationManagerTest, PruneIsIdempotent) {
   EXPECT_EQ(manager()->PruneCompletedOperations(), 1);
   EXPECT_EQ(manager()->PruneCompletedOperations(), 0);
 }
+
+}  // namespace frontend
+}  // namespace emulator
+}  // namespace spanner
 
 }  // namespace google

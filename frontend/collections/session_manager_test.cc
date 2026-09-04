@@ -279,10 +279,6 @@ TEST_F(SessionManagerTest, ListSessionsWithSimilarPrefix) {
   }
 }
 
-}  // namespace frontend
-}  // namespace emulator
-}  // namespace spanner
-
 // PruneSessionsNotUsedSince -- reclaiming abandoned sessions.
 //
 // Expiry is otherwise lazy: GetSession() erases an expired session only when it
@@ -370,5 +366,9 @@ TEST_F(SessionManagerTest, PruneRemovesOnlyTheSessionsPastTheBound) {
               googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
   GOOGLESQL_EXPECT_OK(session_manager_.GetSession(new_uri));
 }
+
+}  // namespace frontend
+}  // namespace emulator
+}  // namespace spanner
 
 }  // namespace google
