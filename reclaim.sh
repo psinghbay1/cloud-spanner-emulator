@@ -135,6 +135,36 @@ else
   TABLES=("$@")
 fi
 
+# Echo the effective configuration before touching anything. This command can
+# erase live rows, so what it was told to do -- and what it resolved the
+# defaults to -- belongs in the log next to the counts it reports.
+echo "reclaim: target      ${REST}  ${PROJECT}/${INSTANCE}"
+if [[ "$ALL" == true ]]; then
+  echo "reclaim: databases   all (${#DATABASES[@]} found)"
+else
+  echo "reclaim: databases   ${DATABASES[*]}"
+fi
+if [[ ${#TABLES[@]} -gt 0 ]]; then
+  echo "reclaim: tables      ${TABLES[*]}"
+else
+  echo "reclaim: tables      all"
+fi
+echo "reclaim: not_before  ${NOT_BEFORE:-<unset> (no lower bound: seed data IS eligible)}"
+if [[ -n "$NOT_AFTER_LAG" ]]; then
+  echo "reclaim: not_after   now - ${NOT_AFTER_LAG}"
+else
+  echo "reclaim: not_after   <unset> (falls back to version_retention_period)"
+fi
+echo "reclaim: retention   ${RETENTION:-<unchanged>}"
+if [[ "$DELETE_ROWS" == true ]]; then
+  echo "reclaim: delete_rows true  (DESTRUCTIVE: erases live rows inside the window)"
+else
+  echo "reclaim: delete_rows false"
+fi
+echo "reclaim: prune_sessions   ${PRUNE_SESSIONS}"
+echo "reclaim: prune_operations ${PRUNE_OPERATIONS}"
+echo
+
 total_rows=0
 total_versions=0
 total_deleted=0
@@ -144,6 +174,7 @@ for database in "${DATABASES[@]}"; do
   # one hour -- so on a fresh CI database a sweep correctly reports 0/0 unless
   # the window is shortened first.
   if [[ -n "$RETENTION" ]]; then
+    echo "reclaim: ${database} <- ALTER DATABASE SET version_retention_period = '${RETENTION}'"
     api PATCH "${PREFIX}/${database}/ddl" \
       "{\"statements\":[\"ALTER DATABASE ${database} SET OPTIONS (version_retention_period = '${RETENTION}')\"]}" \
       > /dev/null || die "could not set retention on ${database}"
@@ -175,6 +206,7 @@ print(payload["name"])')" || die "database \"${database}\" not found on ${PROJEC
     args+="${args:+, }prune_operations => true"
   fi
 
+  echo "reclaim: ${database} <- SELECT EMULATOR_RECLAIM(${args})"
   response="$(api POST "${session}:executeSql" \
     "{\"sql\":\"SELECT EMULATOR_RECLAIM(${args})\"}")"
 
