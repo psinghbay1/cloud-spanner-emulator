@@ -24,6 +24,7 @@ TEST_TARGETS=(
   "//backend/storage:in_memory_storage_test"
   "//backend/schema/updater:schema_updater_test"
   "//frontend/handlers:queries_test"
+  "//frontend/collections:session_manager_test"
 )
 
 VERBOSE=false
@@ -66,6 +67,14 @@ backend/storage/in_memory_storage_test.cc
     PurgeKeepsRowDeletedInsideNotAfterLag
     PurgeVersionsKeepsSeedVersionOfLiveRow
     PurgeWindowLeavesRetentionBehaviourUnchanged
+
+frontend/collections/session_manager_test.cc
+  PruneSessionsNotUsedSince -- reclaiming abandoned sessions
+    PruneRemovesSessionNotUsedSinceBound
+    PruneKeepsRecentlyUsedSession
+    PruneLeavesMultiplexedSessionsByDefault
+    PruneIsIdempotent
+    PruneRemovesOnlyTheSessionsPastTheBound
 
 frontend/handlers/queries_test.cc
   EMULATOR_RECLAIM -- the statement, end to end over gRPC

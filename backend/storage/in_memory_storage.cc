@@ -359,6 +359,60 @@ int64_t InMemoryStorage::PurgeExpiredVersions(
   return erased;
 }
 
+namespace {
+
+// True when a row's creation falls strictly inside the window. Shared by the
+// destructive sweep and its preview so the two can never disagree about what
+// qualifies.
+bool RowCreatedInWindow(const InMemoryStorage::Row& row,
+                        const PurgeWindow& window,
+                        absl::string_view exists_column) {
+  auto cell_itr = row.find(exists_column);
+  if (cell_itr == row.end() || cell_itr->second.empty()) {
+    return false;
+  }
+  // The first _exists version is the commit timestamp of the insert.
+  const absl::Time created = cell_itr->second.begin()->first;
+  if (window.not_before.has_value() && created <= *window.not_before) {
+    return false;  // Seeded before the run.
+  }
+  if (window.not_after.has_value() && created >= *window.not_after) {
+    return false;  // Too recent; a running test may still need it.
+  }
+  return true;
+}
+
+}  // namespace
+
+int64_t InMemoryStorage::CountRowsInWindow(
+    absl::Time timestamp, const std::vector<TableID>& table_ids,
+    const PurgeWindow& window) {
+  absl::MutexLock lock(mu_);
+
+  int64_t matched = 0;
+  auto count_table = [&](const Table& table) {
+    for (const auto& [_, row] : table) {
+      if (RowCreatedInWindow(row, window, kExistsColumn)) {
+        ++matched;
+      }
+    }
+  };
+
+  if (table_ids.empty()) {
+    for (const auto& [_, table] : tables_) {
+      count_table(table);
+    }
+  } else {
+    for (const TableID& table_id : table_ids) {
+      auto table_itr = tables_.find(table_id);
+      if (table_itr != tables_.end()) {
+        count_table(table_itr->second);
+      }
+    }
+  }
+  return matched;
+}
+
 int64_t InMemoryStorage::DeleteRowsInWindow(
     absl::Time timestamp, const std::vector<TableID>& table_ids,
     const PurgeWindow& window) {
@@ -368,20 +422,7 @@ int64_t InMemoryStorage::DeleteRowsInWindow(
   // only sound for a local harness reclaiming between test batches, which is
   // why nothing calls it unless the caller asks by name.
   auto is_in_window = [&](const Row& row) {
-    auto cell_itr = row.find(kExistsColumn);
-    if (cell_itr == row.end() || cell_itr->second.empty()) {
-      return false;
-    }
-    const Cell& cell = cell_itr->second;
-    // The first _exists version is when the row was created.
-    const absl::Time created = cell.begin()->first;
-    if (window.not_before.has_value() && created <= *window.not_before) {
-      return false;  // Seeded before the run.
-    }
-    if (window.not_after.has_value() && created >= *window.not_after) {
-      return false;  // Too recent; a running test may still need it.
-    }
-    return true;
+    return RowCreatedInWindow(row, window, kExistsColumn);
   };
 
   int64_t erased = 0;

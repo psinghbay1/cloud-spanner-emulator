@@ -305,6 +305,7 @@ cc_library(
         "//backend/storage",
         "//common:constants",
         "//common:errors",
+        "//frontend/collections:session_manager",
         "//frontend/common:protos",
         "//frontend/common:validations",
         "//frontend/converters:partition",

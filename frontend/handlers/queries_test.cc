@@ -1386,11 +1386,15 @@ TEST_P(QueryApiTest, EmulatorReclaimReturnsCounters) {
                                     name: "rows_deleted"
                                     type { code: INT64 }
                                   }
+                                  fields {
+                                    name: "sessions_pruned"
+                                    type { code: INT64 }
+                                  }
                                 }
                               }
                             )pb")));
   ASSERT_EQ(response.rows_size(), 1);
-  EXPECT_EQ(response.rows(0).values_size(), 3);
+  EXPECT_EQ(response.rows(0).values_size(), 4);
 }
 
 // Table names still parse now that named arguments share the argument list.
@@ -1530,6 +1534,24 @@ TEST_P(QueryApiTest, EmulatorReclaimKeepsRowsCommittedBeforeNotBefore) {
   GOOGLESQL_ASSERT_OK(ExecuteSql(select, &select_response));
   ASSERT_EQ(select_response.rows_size(), 1);
   EXPECT_NE(select_response.rows(0).values(0).string_value(), "0");
+}
+
+
+// prune_sessions releases abandoned sessions, which the row sweeps cannot
+// reach: sessions are frontend state, not storage.
+TEST_P(QueryApiTest, EmulatorReclaimPrunesSessions) {
+  spanner_api::ExecuteSqlRequest request;
+  request.set_sql(
+      "SELECT EMULATOR_RECLAIM(not_before => '1970-01-01T00:00:00Z', prune_sessions => true)");
+  request.set_session(
+      GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
+
+  spanner_api::ResultSet response;
+  GOOGLESQL_ASSERT_OK(ExecuteSql(request, &response));
+  ASSERT_EQ(response.rows_size(), 1);
+  // Four counters now: rows_purged, versions_purged, rows_deleted,
+  // sessions_pruned.
+  EXPECT_EQ(response.rows(0).values_size(), 4);
 }
 
 }  // namespace

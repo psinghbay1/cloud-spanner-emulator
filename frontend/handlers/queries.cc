@@ -35,12 +35,14 @@
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/optional.h"
 #include "absl/types/variant.h"
 #include "backend/access/read.h"
 #include "backend/database/database.h"
 #include "backend/storage/storage.h"
+#include "frontend/collections/session_manager.h"
 #include "backend/query/change_stream/change_stream_query_validator.h"
 #include "backend/query/query_engine.h"
 #include "common/constants.h"
@@ -321,6 +323,17 @@ bool ParseReclaimDeleteRows(absl::string_view sql) {
   return false;
 }
 
+// True when the caller passed prune_sessions => true.
+bool ParseReclaimPruneSessions(absl::string_view sql) {
+  for (const std::string& argument : SplitReclaimArguments(sql)) {
+    if (IsNamedArgument(argument, "prune_sessions") &&
+        absl::EqualsIgnoreCase(NamedArgumentValue(argument), "true")) {
+      return true;
+    }
+  }
+  return false;
+}
+
 absl::StatusOr<backend::PurgeWindow> ParseReclaimWindow(absl::string_view sql,
                                                         absl::Time now) {
   backend::PurgeWindow window;
@@ -360,7 +373,8 @@ absl::StatusOr<backend::PurgeWindow> ParseReclaimWindow(absl::string_view sql,
 
 // Answers the reclaim statement with a one-row, one-column INT64 result set
 // holding the number of purged rows.
-absl::Status HandleEmulatorReclaim(std::shared_ptr<Session> session,
+absl::Status HandleEmulatorReclaim(RequestContext* ctx,
+                                   std::shared_ptr<Session> session,
                                    absl::string_view sql,
                                    spanner_api::ResultSet* response) {
   // Session::database() hands back the frontend wrapper; ReclaimStorage lives on
@@ -380,6 +394,19 @@ absl::Status HandleEmulatorReclaim(std::shared_ptr<Session> session,
                    session->database()->backend()->ReclaimStorage(
                        ParseReclaimTableNames(sql), window, delete_rows));
 
+  // Sessions are frontend state, so they are swept here rather than in the
+  // backend. A session not used since the window's upper bound cannot be in
+  // use by a running test, and an already-expired session is unusable anyway --
+  // GetSession() reports it as not found -- so this only frees dead memory.
+  int64_t sessions_pruned = 0;
+  if (ParseReclaimPruneSessions(sql)) {
+    const absl::Time not_used_since =
+        window.not_after.value_or(absl::Now() - absl::Hours(1));
+    sessions_pruned =
+        ctx->env()->session_manager()->PruneSessionsNotUsedSince(
+            not_used_since);
+  }
+
   auto* row_type = response->mutable_metadata()->mutable_row_type();
   auto* rows_field = row_type->add_fields();
   rows_field->set_name("rows_purged");
@@ -390,11 +417,15 @@ absl::Status HandleEmulatorReclaim(std::shared_ptr<Session> session,
   auto* deleted_field = row_type->add_fields();
   deleted_field->set_name("rows_deleted");
   deleted_field->mutable_type()->set_code(google::spanner::v1::TypeCode::INT64);
+  auto* sessions_field = row_type->add_fields();
+  sessions_field->set_name("sessions_pruned");
+  sessions_field->mutable_type()->set_code(google::spanner::v1::TypeCode::INT64);
 
   auto* row = response->add_rows();
   row->add_values()->set_string_value(absl::StrCat(stats.rows_purged));
   row->add_values()->set_string_value(absl::StrCat(stats.versions_purged));
   row->add_values()->set_string_value(absl::StrCat(stats.rows_deleted));
+  row->add_values()->set_string_value(absl::StrCat(sessions_pruned));
   return absl::OkStatus();
 }
 
@@ -412,7 +443,7 @@ absl::Status ExecuteSql(RequestContext* ctx,
   // Emulator-only storage reclamation. Handled before transaction setup and
   // query planning: it is not a real query and takes no transaction.
   if (IsEmulatorReclaimStatement(request->sql())) {
-    return HandleEmulatorReclaim(session, request->sql(), response);
+    return HandleEmulatorReclaim(ctx, session, request->sql(), response);
   }
 
   // Get underlying transaction.

@@ -63,6 +63,20 @@ class SessionManager {
   bool IsMultiplexedSession(const std::string& session_uri) const
       ABSL_LOCKS_EXCLUDED(mu_);
 
+  // Erases sessions not used since `not_used_since`, returning how many were
+  // removed. Multiplexed sessions are left alone unless `prune_multiplexed`:
+  // they expire after 28 days, not an hour, and a client keeps using one.
+  //
+  // Expiry is otherwise lazy. GetSession() erases an expired session, but only
+  // when that session is looked up again, and a harness that abandons a session
+  // never looks it up; ListSessions() filters expired sessions out of its
+  // response while leaving them in the map. Either way an abandoned session is
+  // unreachable but still held, along with its retained transactions, for the
+  // life of the process. This is the sweep that actually frees them.
+  int64_t PruneSessionsNotUsedSince(absl::Time not_used_since,
+                                    bool prune_multiplexed = false)
+      ABSL_LOCKS_EXCLUDED(mu_);
+
  private:
   // System-wide clock.
   Clock* clock_;

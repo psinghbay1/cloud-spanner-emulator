@@ -257,6 +257,42 @@ The port is the **REST gateway** — 9020 by default — not the gRPC port 9010.
 bare host with no port gets `:9020` appended. Pointing at 9010 fails with the
 same "no emulator REST gateway" message, which names the address it tried.
 
+### Pruning abandoned sessions
+
+Row storage is not the only thing a long-lived container holds. Every session a
+client creates is kept in `session_map_`, along with the transactions retained
+under it, and expiry is **lazy**:
+
+- `GetSession()` erases an expired session, but only when that session is looked
+  up again — and a harness that abandons a session never looks it up.
+- `ListSessions()` filters expired sessions out of its *response* while leaving
+  them in the map, so they become invisible but are still held.
+
+Either way an abandoned session survives for the life of the process. A suite
+that creates sessions per test accumulates all of them. The row sweeps cannot
+reach this: sessions are frontend state.
+
+`--prune-sessions` erases sessions not used since the window's upper bound:
+
+```bash
+./reclaim.sh --all --not-after-lag 60s --prune-sessions
+```
+
+The count comes back as a fourth column, `sessions_pruned`. Multiplexed sessions
+are left alone — they expire after 28 days rather than an hour, and a client
+keeps using one.
+
+This is safe by construction: a session not touched since the bound cannot be in
+use by a running test, and an expired session is already unusable, since
+`GetSession()` reports it as not found. Pruning only releases memory that is
+already dead.
+
+**Transactions and locks are already bounded** and need no sweep.
+`transaction_map_` is capped at `kMaxTransactionsPerSession`; adding a
+transaction evicts the oldest and calls `Close()` on it, which releases its lock
+handle. Locks therefore do not accumulate and cannot interfere with new
+transactions. Pruning a session releases the transactions retained under it.
+
 ### Verifying reclamation
 
 Two harnesses, both measuring **container RSS** — the only measure that settles

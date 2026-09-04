@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import datetime
 import json
 import subprocess
 import sys
@@ -46,6 +47,27 @@ def patch(root, path, payload):
         root + path, data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"}, method="PATCH")
     urllib.request.urlopen(request, timeout=900)
+
+
+def write_rows(root, session, start, end, pad, batch_size=250):
+    """Insert rows [start, end) in batches, as main() does."""
+    for offset in range(start, end, batch_size):
+        limit = min(offset + batch_size, end)
+        post(root, f"{session}:commit", {
+            "singleUseTransaction": {"readWrite": {}},
+            "mutations": [{"insertOrUpdate": {
+                "table": "T", "columns": ["id", "a", "b"],
+                "values": [[str(k), pad, pad] for k in range(offset, limit)]}}]})
+
+
+def count_rows(root, session):
+    result = post(root, f"{session}:executeSql", {"sql": "SELECT COUNT(*) FROM T"})
+    return result["rows"][0][0]
+
+
+def now_rfc3339():
+    return datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
 
 
 def main():
@@ -113,6 +135,56 @@ def main():
         print("        holds the pages. Check that malloc_trim is compiled in.")
         return 1
     print(f"  PASS: recovered {recovered:.1f} MiB; {growth:.1f} MiB above baseline.")
+
+    # Second scenario: the seeded-database workflow. Rows written before the
+    # boundary must survive a destructive sweep, and rows written after it must
+    # not. This is the guarantee the bounds exist to provide, so the smoke test
+    # checks it against a real emulator rather than only in unit tests.
+    print()
+    print("  Seeded-database bounds")
+    seed_rows = 500
+    write_rows(root, session, 0, seed_rows, "S")
+    seed_done = now_rfc3339()
+    time.sleep(2)  # let the seed rows age past the boundary
+    write_rows(root, session, seed_rows, seed_rows + 500, "T")
+
+    before = int(count_rows(root, session))
+    reclaimed = post(root, f"{session}:executeSql", {
+        "sql": ("SELECT EMULATOR_RECLAIM("
+                f"not_before => '{seed_done}', delete_rows => true)")})
+    deleted = int(reclaimed["rows"][0][2])
+    after = int(count_rows(root, session))
+
+    print(f"    rows before sweep       : {before}")
+    print(f"    rows deleted            : {deleted}")
+    print(f"    rows remaining          : {after}")
+
+    if after < seed_rows:
+        print(f"    FAIL: only {after} rows left; the {seed_rows} seeded rows")
+        print("          must survive a sweep bounded by not_before.")
+        return 1
+    if deleted == 0:
+        print("    FAIL: nothing was deleted; rows written after the boundary")
+        print("          should have been reclaimed.")
+        return 1
+    print(f"    PASS: {seed_rows} seeded rows kept, {deleted} test rows dropped.")
+
+    # Third scenario: abandoned sessions are frontend state and are not freed
+    # by the row sweeps at all.
+    print()
+    print("  Session pruning")
+    for _ in range(20):
+        post(root, f"{databases}/{DATABASE}/sessions", {})
+    pruned = post(root, f"{session}:executeSql", {
+        "sql": ("SELECT EMULATOR_RECLAIM(not_before => '1970-01-01T00:00:00Z', "
+                "prune_sessions => true)")})
+    sessions_pruned = int(pruned["rows"][0][3])
+    print(f"    sessions pruned         : {sessions_pruned}")
+    if sessions_pruned == 0:
+        print("    FAIL: no sessions pruned; abandoned sessions are retained")
+        print("          for the life of the process.")
+        return 1
+    print(f"    PASS: {sessions_pruned} abandoned sessions released.")
     return 0
 
 

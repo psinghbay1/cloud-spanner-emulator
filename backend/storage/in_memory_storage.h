@@ -98,6 +98,11 @@ class InMemoryStorage : public Storage {
                              const PurgeWindow& window) override
       ABSL_LOCKS_EXCLUDED(mu_);
 
+  int64_t CountRowsInWindow(absl::Time timestamp,
+                            const std::vector<TableID>& table_ids,
+                            const PurgeWindow& window) override
+      ABSL_LOCKS_EXCLUDED(mu_);
+
  private:
   using Cell = std::map<absl::Time, googlesql::Value>;
   using Row = absl::flat_hash_map<ColumnID, Cell>;

@@ -21,6 +21,11 @@
 # of the memory. It is destructive and requires a bound:
 #   ./reclaim.sh --all --not-before "$SEED_DONE" --not-after-lag 60s --delete-rows
 #
+# --prune-sessions additionally erases sessions not used since the window's upper
+# bound. Abandoned sessions are held for the life of the process -- expiry is
+# lazy and never fires for a session nobody looks up again -- and the row sweeps
+# cannot reach them. Multiplexed sessions are left alone.
+#
 # --not-before protects everything written at or before that instant: seed data
 # is the oldest data present, so a plain sweep reaches it first. --not-after-lag
 # holds back the newest writes, so an in-flight test never loses rows underneath
@@ -51,6 +56,7 @@ RETENTION=""
 NOT_BEFORE=""
 NOT_AFTER_LAG=""
 DELETE_ROWS=false
+PRUNE_SESSIONS=false
 ALL=false
 LIST=false
 
@@ -65,6 +71,7 @@ while [[ $# -gt 0 ]]; do
     --not-before) NOT_BEFORE="$2"; shift 2 ;;
     --not-after-lag) NOT_AFTER_LAG="$2"; shift 2 ;;
     --delete-rows) DELETE_ROWS=true; shift ;;
+    --prune-sessions) PRUNE_SESSIONS=true; shift ;;
     -h|--help)   sed -n '2,40p' "$0"; exit 0 ;;
     --*)         echo "unknown flag: $1" >&2; exit 1 ;;
     *)           break ;;
@@ -155,6 +162,9 @@ print(payload["name"])')" || die "database \"${database}\" not found on ${PROJEC
   if [[ "$DELETE_ROWS" == true ]]; then
     args+="${args:+, }delete_rows => true"
   fi
+  if [[ "$PRUNE_SESSIONS" == true ]]; then
+    args+="${args:+, }prune_sessions => true"
+  fi
 
   response="$(api POST "${session}:executeSql" \
     "{\"sql\":\"SELECT EMULATOR_RECLAIM(${args})\"}")"
@@ -168,13 +178,15 @@ if "rows" not in payload:
     sys.exit("reclaim failed: " + message +
              "\n       (a stock emulator rejects EMULATOR_RECLAIM; this needs the fork build)")
 row = payload["rows"][0]
-print(row[0], row[1], row[2] if len(row) > 2 else 0)')" || exit 1
-  read -r rows versions deleted <<< "$parsed"
+print(row[0], row[1],
+      row[2] if len(row) > 2 else 0,
+      row[3] if len(row) > 3 else 0)')" || exit 1
+  read -r rows versions deleted sessions <<< "$parsed"
 
   scope="whole database"
   [[ ${#TABLES[@]} -gt 0 ]] && scope="${#TABLES[@]} table(s)"
-  printf '%-28s %10s rows  %10s versions  %10s deleted   (%s)\n' \
-    "$database" "$rows" "$versions" "$deleted" "$scope"
+  printf '%-28s %10s rows  %10s versions  %10s deleted  %8s sessions   (%s)\n' \
+    "$database" "$rows" "$versions" "$deleted" "$sessions" "$scope"
   total_rows=$(( total_rows + rows ))
   total_versions=$(( total_versions + versions ))
   total_deleted=$(( total_deleted + deleted ))

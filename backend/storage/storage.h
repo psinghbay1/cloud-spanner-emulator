@@ -165,6 +165,12 @@ class Storage {
   virtual int64_t DeleteRowsInWindow(absl::Time timestamp,
                                      const std::vector<TableID>& table_ids,
                                      const PurgeWindow& window) = 0;
+
+  // Counts what DeleteRowsInWindow would erase, erasing nothing. Lets a caller
+  // check the bounds against real data before running a destructive sweep.
+  virtual int64_t CountRowsInWindow(absl::Time timestamp,
+                                    const std::vector<TableID>& table_ids,
+                                    const PurgeWindow& window) = 0;
 };
 
 }  // namespace backend
