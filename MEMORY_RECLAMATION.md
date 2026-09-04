@@ -624,10 +624,26 @@ contention is an artefact of sharing one database. The `developers/ci` pool
 already supports a database per shard, and this is often the real fix for a CI
 suite.
 
-**4. Make the lock per-key.** Replace `active_handle_` with a map from key range
-to holder, plus deadlock detection. This is a genuine feature rather than a
-tweak, and without wound-wait it trades aborts for deadlocks, which are worse.
-Not recommended alongside the reclamation work.
+**4. Make the lock per-key.** This is what real Spanner does, and it is the only
+option that genuinely adds concurrency rather than managing its absence.
+
+The plumbing is already there, which makes it more approachable than it first
+looks. `LockRequest` (`backend/locking/request.h`) carries the mode, table, key
+range and columns, and `TransactionStore` passes real key ranges on every read
+and write. `EnqueueLock` simply discards all of it and consults one pointer.
+Replacing `active_handle_` with a map keyed by `(table_id, key_range)` is a
+contained change.
+
+**The lock table is not the hard part — deadlock is.** Today two transactions
+can never wait on each other, because one is aborted immediately. The moment
+both can hold locks, they can form a cycle, and a half-finished implementation
+trades a clean `ABORTED` that clients already retry for a hang that they do not.
+That is strictly worse than the current behaviour. Doing this properly means
+wound-wait or a wait-for graph, and interval-overlap conflict detection rather
+than a hash lookup, since `KeyRange` is a range and not a point.
+
+Worth its own ticket with its own tests. It is orthogonal to reclamation, and
+bundling it here would tie a memory fix to a much riskier change.
 
 ### Why this matters for reclamation
 
