@@ -2,8 +2,9 @@
 #
 # Build and test the emulator with the memory-reclamation changes.
 #
-#   ./build.sh              # build everything, then run the reclamation tests
+#   ./build.sh              # build the emulator binaries, then run the reclamation tests
 #   ./build.sh test         # tests only (assumes a prior build)
+#   ./build.sh all          # every target, incl. developer tools (needs libreadline-dev)
 #   ./build.sh all-tests    # the full upstream test suite (slow: 30-60+ min)
 #   ./build.sh docker       # run the build+tests inside the upstream devcontainer
 #
@@ -33,6 +34,20 @@ RECLAIM_TEST_TARGETS=(
   "//backend/schema/updater:schema_updater_test"
 )
 
+# The targets the release image ships. build/docker/Dockerfile.ubuntu builds
+# exactly these two and says so: "Build the emulator binaries only. Since we are
+# only copying the binaries to the release image, we don't need to build the
+# rest of the targets."
+#
+# Building //... instead pulls in developer tools the emulator never uses --
+# notably //third_party/spanner_pg/src/bin/psql, which fails to link unless GNU
+# readline development headers are installed. Use `./build.sh all` if you really
+# want every target.
+EMULATOR_TARGETS=(
+  "//binaries:emulator_main"
+  "//binaries:gateway_main"
+)
+
 log() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
 require_bazel() {
@@ -59,7 +74,14 @@ require_jdk() {
 }
 
 build_all() {
-  log "Building //... (first run is slow; GoogleSQL + PostgreSQL are compiled from source)"
+  log "Building the emulator binaries (first run is slow; GoogleSQL + PostgreSQL are compiled from source)"
+  bazel build "${EMULATOR_TARGETS[@]}"
+}
+
+# Every target, including developer tools the emulator does not ship. Needs GNU
+# readline installed for psql to link.
+build_everything() {
+  log "Building //... (includes developer tools; needs libreadline-dev for psql)"
   bazel build //...
 }
 
@@ -104,6 +126,9 @@ case "$MODE" in
   all-tests)
     run_all_tests
     ;;
+  all)
+    build_everything
+    ;;
   docker)
     run_in_devcontainer
     ;;
@@ -112,7 +137,7 @@ case "$MODE" in
     run_reclaim_tests
     ;;
   *)
-    echo "usage: $0 [build|test|all-tests|docker|build-and-test]" >&2
+    echo "usage: $0 [build|test|all|all-tests|docker|build-and-test]" >&2
     exit 1
     ;;
 esac
