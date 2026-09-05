@@ -19,6 +19,7 @@
 #include <string>
 
 #include "gmock/gmock.h"
+#include "google/protobuf/empty.pb.h"
 #include "gtest/gtest.h"
 #include "googlesql/base/testing/status_matchers.h"
 #include "tests/common/proto_matchers.h"
@@ -138,7 +139,69 @@ TEST_F(OperationManagerTest, ListsOperationsWithSimilarInstanceURI) {
             operation_pb.name());
 }
 
+// PruneCompletedOperations -- reclaiming finished long-running operations.
+//
+// One operation is created for every CreateDatabase and UpdateDdl, and removed
+// only when a client explicitly calls DeleteOperation, which clients rarely do.
+// Nothing else prunes the map.
+
+TEST_F(OperationManagerTest, PruneRemovesCompletedOperation) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Operation> operation,
+      manager()->CreateOperation("projects/123/instances/456", "789"));
+  operation->SetResponse(google::protobuf::Empty());
+
+  EXPECT_EQ(manager()->PruneCompletedOperations(), 1);
+  EXPECT_THAT(manager()->GetOperation("projects/123/instances/456/operations/789"),
+              googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST_F(OperationManagerTest, PruneRemovesFailedOperation) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Operation> operation,
+      manager()->CreateOperation("projects/123/instances/456", "789"));
+  // An error also puts the operation in a done state.
+  operation->SetError(absl::InternalError("failed"));
+
+  EXPECT_EQ(manager()->PruneCompletedOperations(), 1);
+}
+
+TEST_F(OperationManagerTest, PruneKeepsInFlightOperation) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Operation> operation,
+      manager()->CreateOperation("projects/123/instances/456", "789"));
+  // Neither a response nor an error: still running, so it must survive.
+  EXPECT_EQ(manager()->PruneCompletedOperations(), 0);
+  GOOGLESQL_EXPECT_OK(
+      manager()->GetOperation("projects/123/instances/456/operations/789"));
+}
+
+TEST_F(OperationManagerTest, PruneRemovesOnlyCompletedOperations) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Operation> done,
+      manager()->CreateOperation("projects/123/instances/456", "done"));
+  done->SetResponse(google::protobuf::Empty());
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Operation> running,
+      manager()->CreateOperation("projects/123/instances/456", "running"));
+
+  EXPECT_EQ(manager()->PruneCompletedOperations(), 1);
+  GOOGLESQL_EXPECT_OK(
+      manager()->GetOperation("projects/123/instances/456/operations/running"));
+}
+
+TEST_F(OperationManagerTest, PruneIsIdempotent) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Operation> operation,
+      manager()->CreateOperation("projects/123/instances/456", "789"));
+  operation->SetResponse(google::protobuf::Empty());
+
+  EXPECT_EQ(manager()->PruneCompletedOperations(), 1);
+  EXPECT_EQ(manager()->PruneCompletedOperations(), 0);
+}
+
 }  // namespace frontend
 }  // namespace emulator
 }  // namespace spanner
+
 }  // namespace google

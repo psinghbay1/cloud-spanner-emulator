@@ -17,7 +17,12 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_IN_MEMORY_STORAGE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_IN_MEMORY_STORAGE_H_
 
+#include <cstdint>
+#include <map>
+#include <vector>
+
 #include "googlesql/public/value.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/time/time.h"
 #include "backend/common/ids.h"
 #include "backend/datamodel/key.h"
@@ -78,9 +83,34 @@ class InMemoryStorage : public Storage {
                          ColumnID dropped_column_id) override
       ABSL_LOCKS_EXCLUDED(mu_);
 
+  int64_t PurgeExpiredDeletedRows(absl::Time timestamp,
+                                  const std::vector<TableID>& table_ids,
+                                  const PurgeWindow& window = {})
+      override ABSL_LOCKS_EXCLUDED(mu_);
+
+  int64_t PurgeExpiredVersions(absl::Time timestamp,
+                               const std::vector<TableID>& table_ids,
+                               const PurgeWindow& window = {}) override
+      ABSL_LOCKS_EXCLUDED(mu_);
+
+  int64_t DeleteRowsInWindow(absl::Time timestamp,
+                             const std::vector<TableID>& table_ids,
+                             const PurgeWindow& window) override
+      ABSL_LOCKS_EXCLUDED(mu_);
+
+  int64_t CountRowsInWindow(absl::Time timestamp,
+                            const std::vector<TableID>& table_ids,
+                            const PurgeWindow& window) override
+      ABSL_LOCKS_EXCLUDED(mu_);
+
  private:
   using Cell = std::map<absl::Time, googlesql::Value>;
   using Row = absl::flat_hash_map<ColumnID, Cell>;
+
+  // True when a row's creation falls strictly inside the window. Shared by the
+  // destructive sweep and its preview so the two cannot disagree about what
+  // qualifies.
+  static bool RowCreatedInWindow(const Row& row, const PurgeWindow& window);
   using Table = std::map<Key, Row>;
   using Tables = absl::flat_hash_map<TableID, Table>;
 

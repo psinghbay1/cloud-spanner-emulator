@@ -300,6 +300,216 @@ void InMemoryStorage::CleanUpDeletedColumns(absl::Time timestamp) {
   }
 }
 
+int64_t InMemoryStorage::PurgeExpiredVersions(
+    absl::Time timestamp, const std::vector<TableID>& table_ids,
+    const PurgeWindow& window) {
+  absl::MutexLock lock(mu_);
+  absl::Time expiration_time;
+  {
+    absl::MutexLock retention_lock(version_retention_period_mu_);
+    expiration_time =
+        window.not_after.value_or(timestamp - version_retention_period_);
+  }
+
+  // RemoveExpiredVersions() only runs while its own cell is being written, so
+  // a row that is updated a few times and then left alone keeps every
+  // superseded version for the lifetime of the process. Sweep them here.
+  //
+  // The newest version at or before the retention floor is kept, so a read
+  // anywhere inside the retention window still resolves correctly. This is the
+  // same rule RemoveExpiredVersions() applies.
+  int64_t erased = 0;
+  auto purge_cell = [&](Cell& cell) {
+    auto upper_bound = cell.upper_bound(expiration_time);
+    // Start above `not_before` so a seed row keeps the version it was seeded
+    // with; only versions written inside the window are trimmed.
+    auto begin = window.not_before.has_value()
+                     ? cell.upper_bound(*window.not_before)
+                     : cell.begin();
+    for (auto it = begin; it != upper_bound;) {
+      auto next = it;
+      if (++next == upper_bound) {
+        break;  // Keep the version covering the retention period.
+      }
+      it = cell.erase(it);
+      ++erased;
+    }
+  };
+
+  auto purge_table = [&](Table& table) {
+    for (auto& [_, row] : table) {
+      for (auto& [_column_id, cell] : row) {
+        purge_cell(cell);
+      }
+    }
+  };
+
+  if (table_ids.empty()) {
+    for (auto& [_, table] : tables_) {
+      purge_table(table);
+    }
+  } else {
+    for (const TableID& table_id : table_ids) {
+      auto table_itr = tables_.find(table_id);
+      if (table_itr != tables_.end()) {
+        purge_table(table_itr->second);
+      }
+    }
+  }
+  return erased;
+}
+
+bool InMemoryStorage::RowCreatedInWindow(const Row& row,
+                                         const PurgeWindow& window) {
+  auto cell_itr = row.find(kExistsColumn);
+  if (cell_itr == row.end() || cell_itr->second.empty()) {
+    return false;
+  }
+  // The first _exists version is the commit timestamp of the insert.
+  const absl::Time created = cell_itr->second.begin()->first;
+  if (window.not_before.has_value() && created <= *window.not_before) {
+    return false;  // Seeded before the run.
+  }
+  if (window.not_after.has_value() && created >= *window.not_after) {
+    return false;  // Too recent; a running test may still need it.
+  }
+  return true;
+}
+
+int64_t InMemoryStorage::CountRowsInWindow(
+    absl::Time timestamp, const std::vector<TableID>& table_ids,
+    const PurgeWindow& window) {
+  absl::MutexLock lock(mu_);
+
+  int64_t matched = 0;
+  auto count_table = [&](const Table& table) {
+    for (const auto& [_, row] : table) {
+      if (RowCreatedInWindow(row, window)) {
+        ++matched;
+      }
+    }
+  };
+
+  if (table_ids.empty()) {
+    for (const auto& [_, table] : tables_) {
+      count_table(table);
+    }
+  } else {
+    for (const TableID& table_id : table_ids) {
+      auto table_itr = tables_.find(table_id);
+      if (table_itr != tables_.end()) {
+        count_table(table_itr->second);
+      }
+    }
+  }
+  return matched;
+}
+
+int64_t InMemoryStorage::DeleteRowsInWindow(
+    absl::Time timestamp, const std::vector<TableID>& table_ids,
+    const PurgeWindow& window) {
+  absl::MutexLock lock(mu_);
+
+  // Unlike the purge sweeps, this erases rows a reader can still see. It is
+  // only sound for a local harness reclaiming between test batches, which is
+  // why nothing calls it unless the caller asks by name.
+  auto is_in_window = [&](const Row& row) {
+    return RowCreatedInWindow(row, window);
+  };
+
+  int64_t erased = 0;
+  auto delete_table = [&](Table& table) {
+    for (auto it = table.begin(); it != table.end();) {
+      if (is_in_window(it->second)) {
+        it = table.erase(it);
+        ++erased;
+      } else {
+        ++it;
+      }
+    }
+  };
+
+  if (table_ids.empty()) {
+    for (auto& [_, table] : tables_) {
+      delete_table(table);
+    }
+  } else {
+    for (const TableID& table_id : table_ids) {
+      auto table_itr = tables_.find(table_id);
+      if (table_itr != tables_.end()) {
+        delete_table(table_itr->second);
+      }
+    }
+  }
+  return erased;
+}
+
+int64_t InMemoryStorage::PurgeExpiredDeletedRows(
+    absl::Time timestamp, const std::vector<TableID>& table_ids,
+    const PurgeWindow& window) {
+  absl::MutexLock lock(mu_);
+  absl::MutexLock version_retention_period_lock(version_retention_period_mu_);
+  // An explicit upper bound overrides the retention period, so a caller can
+  // sweep without first shortening version_retention_period -- which is a
+  // schema change that breaks stale reads.
+  absl::Time expiration_time =
+      window.not_after.value_or(timestamp - version_retention_period_);
+
+  // A row may only be erased when it is invisible at every timestamp a
+  // transaction may legally read. Reads below the retention floor are already
+  // rejected, so a row deleted before `expiration_time` and never rewritten
+  // since cannot be observed by anyone.
+  auto is_purgeable = [&](const Row& row) {
+    auto cell_itr = row.find(kExistsColumn);
+    if (cell_itr == row.end()) {
+      return false;
+    }
+    const Cell& cell = cell_itr->second;
+    // A row first written at or before `not_before` is seed data. It must
+    // survive even when a test later deleted it: erasing it would destroy
+    // state the run was given, not churn the run produced. Only its
+    // superseded versions are reclaimable, which PurgeExpiredVersions does.
+    if (window.not_before.has_value() && !cell.empty() &&
+        cell.begin()->first <= *window.not_before) {
+      return false;
+    }
+    // A version at or after the retention floor means the row may still be
+    // read, whether it resurrects the row or deletes it again.
+    if (cell.upper_bound(expiration_time) != cell.end()) {
+      return false;
+    }
+    // Row is deleted iff its newest version marks it non-existent.
+    const googlesql::Value& newest = cell.rbegin()->second;
+    return newest.is_valid() && !newest.bool_value();
+  };
+
+  int64_t purged = 0;
+  auto purge_table = [&](Table& table) {
+    for (auto it = table.begin(); it != table.end();) {
+      if (is_purgeable(it->second)) {
+        it = table.erase(it);
+        ++purged;
+      } else {
+        ++it;
+      }
+    }
+  };
+
+  if (table_ids.empty()) {
+    for (auto& [_, table] : tables_) {
+      purge_table(table);
+    }
+  } else {
+    for (const TableID& table_id : table_ids) {
+      auto table_itr = tables_.find(table_id);
+      if (table_itr != tables_.end()) {
+        purge_table(table_itr->second);
+      }
+    }
+  }
+  return purged;
+}
+
 void InMemoryStorage::MarkDroppedTable(absl::Time timestamp,
                                        TableID dropped_table_id) {
   absl::MutexLock lock(mu_);

@@ -58,12 +58,16 @@ class Operation {
   void ToProto(google::longrunning::Operation* operation_pb)
       ABSL_LOCKS_EXCLUDED(mu_);
 
+  // True once a response or an error has been set. Matches the `done` field
+  // ToProto() emits.
+  bool done() const ABSL_LOCKS_EXCLUDED(mu_);
+
  private:
   // The immutable URI for an operation.
   const std::string operation_uri_;
 
   // Mutex to guard state below.
-  absl::Mutex mu_;
+  mutable absl::Mutex mu_;
 
   // The metadata for this operation.
   std::unique_ptr<google::protobuf::Message> metadata_ ABSL_GUARDED_BY(mu_);

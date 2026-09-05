@@ -85,6 +85,20 @@ class OperationManager {
   absl::StatusOr<std::vector<std::shared_ptr<Operation>>> ListOperations(
       const std::string& resource_uri) ABSL_LOCKS_EXCLUDED(mu_);
 
+  // Erases completed operations, returning how many were removed. In-flight
+  // operations are left alone.
+  //
+  // An operation is created for every CreateDatabase and UpdateDdl, and removed
+  // only when a client explicitly calls DeleteOperation -- which clients rarely
+  // do. Nothing else prunes the map, so a run with heavy schema churn holds
+  // every operation it ever created for the life of the process.
+  //
+  // A completed operation is finished work: its response or error has been set
+  // and the caller is no longer waiting on it. Pruning one only makes a later
+  // GetOperation report NOT_FOUND, exactly as a client-issued DeleteOperation
+  // would.
+  int64_t PruneCompletedOperations() ABSL_LOCKS_EXCLUDED(mu_);
+
  private:
   // Mutex to guard state below.
   absl::Mutex mu_;

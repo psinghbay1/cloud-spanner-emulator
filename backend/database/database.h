@@ -122,6 +122,40 @@ class Database {
 
   PgOidAssigner* get_pg_oid_assigner() { return pg_oid_assigner_.get(); }
 
+  // Counts returned by ReclaimStorage().
+  struct ReclaimStats {
+    int64_t rows_purged = 0;
+    int64_t versions_purged = 0;
+    // Live rows erased by the opt-in destructive sweep; 0 unless requested.
+    int64_t rows_deleted = 0;
+  };
+
+  // Reclaims storage held by deleted rows, dropped tables and dropped columns,
+  // then asks the allocator to return free pages to the OS.
+  //
+  // EMULATOR ONLY. Cloud Spanner has no equivalent API; it reclaims storage in
+  // the background. The emulator does not, so a long-lived container otherwise
+  // grows for its whole lifetime. Intended for local test harnesses that want
+  // to reclaim between test batches instead of restarting the container.
+  //
+  // `table_names` scopes the sweep to those tables; an empty vector sweeps the
+  // whole database. Unknown names are ignored rather than rejected, so a caller
+  // sweeping a fixed list need not track schema changes. Idempotent.
+  //
+  // `window` bounds which versions are eligible. Its `not_before` protects
+  // data seeded before a run: seed data is the oldest in the database, so an
+  // unbounded sweep reaches it first. Its `not_after` overrides the retention
+  // period, letting a caller hold back the most recent writes without the
+  // schema change that shortening version_retention_period requires.
+  //
+  // `delete_rows_in_window` additionally erases LIVE rows whose commit
+  // timestamp falls inside `window`. Off by default: it destroys data the
+  // application can still read, and is only sound for a local harness
+  // clearing test data between batches.
+  absl::StatusOr<ReclaimStats> ReclaimStorage(
+      const std::vector<std::string>& table_names,
+      const PurgeWindow& window = {}, bool delete_rows_in_window = false);
+
  private:
   Database();
   // Delete copy and assignment operators since database shouldn't be copyable.

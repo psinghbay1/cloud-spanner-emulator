@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 #
 # Copyright 2020 Google LLC
 #
@@ -44,6 +45,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     default-jdk \
     protobuf-compiler \
     python3 \
+    lld \
     && add-apt-repository ppa:ubuntu-toolchain-r/test -y \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -68,7 +70,47 @@ WORKDIR /src
 COPY build/bazel build/bazel/
 COPY MODULE.bazel MODULE.bazel.lock* .bazelversion .bazelrc BUILD.bazel \
     requirements.txt go.mod go.sum ./
-RUN bazel build -c opt \
+
+# .bazelrc sets --jobs=auto, which sizes parallelism to CPU count and ignores
+# memory. Compiling GoogleSQL runs many cc1plus processes that each need ~1-2 GB,
+# so on a Docker VM with less RAM than (cores x 2 GB) the build dies with
+# "gcc: fatal error: Killed signal terminated program cc1plus" and
+# "ResourceExhausted: cannot allocate memory".
+#
+# BAZEL_JOBS caps it. Leave empty to keep upstream behaviour.
+ARG BAZEL_JOBS=""
+ENV BAZEL_JOBS_ARG=${BAZEL_JOBS:+--jobs=${BAZEL_JOBS}}
+
+# GoogleSQL's tm_parser.cc is a bison-generated parser compiled as one
+# translation unit; at -O2 a single cc1plus peaks around 8-10 GB and is
+# OOM-killed on a modest VM. GCC_MEMORY_COPTS makes GCC's garbage collector run
+# far more aggressively, which cuts peak RSS without changing generated code
+# (unlike lowering -O, which would).
+#
+#   ggc-min-expand=10    collect once the heap grows 10% (default scales to 100%)
+#   ggc-min-heapsize     start collecting from 32 MB rather than much later
+#   -fno-var-tracking*   skip costly debug-location tracking (-g0 is set anyway)
+#
+# Empty by default so upstream behaviour is unchanged.
+ARG GCC_MEMORY_COPTS=""
+ENV GCC_MEMORY_ARGS=${GCC_MEMORY_COPTS:+${GCC_MEMORY_COPTS}}
+
+# A Bazel disk cache, mounted from the host as a BuildKit cache mount, survives
+# Docker layer invalidation. Without it, editing MODULE.bazel or .bazelrc forces
+# a full GoogleSQL rebuild (~2h); with it, Bazel reuses the compiled artifacts
+# and the same edit costs minutes. The mount is not part of the image, so the
+# published image is unchanged.
+# Bazel's C++ toolchain selects gold when it is installed, but gold crashes
+# linking the emulator binary on aarch64: "internal error in
+# try_fix_erratum_843419_optimized, at gold/aarch64.cc" -- its Cortex-A53
+# erratum workaround fails on a binary this large. LLD has no such defect and
+# links faster, so use it on every architecture.
+ENV BAZEL_LINK_ARGS="--linkopt=-fuse-ld=lld"
+
+ENV BAZEL_DISK_CACHE=/root/.cache/bazel-disk
+RUN --mount=type=cache,target=/root/.cache/bazel-disk,sharing=locked \
+    bazel build -c opt ${BAZEL_JOBS_ARG} ${GCC_MEMORY_ARGS} ${BAZEL_LINK_ARGS} \
+    --disk_cache=${BAZEL_DISK_CACHE} \
     @com_google_googlesql//googlesql/public:value \
     @com_google_googlesql//googlesql/public:analyzer
 
@@ -82,7 +124,9 @@ RUN find third_party/spanner_pg -name "nodes.h" -exec sed -i 's/enum NodeTag : i
 # Since we are only copying the binaries to the release image, we don't need to
 # build the rest of the targets.
 ENV EXTRA_BAZEL_ARGS="--tool_java_runtime_version=local_jdk"
-RUN bazel build -c opt \
+RUN --mount=type=cache,target=/root/.cache/bazel-disk,sharing=locked \
+    bazel build -c opt ${BAZEL_JOBS_ARG} ${GCC_MEMORY_ARGS} ${BAZEL_LINK_ARGS} \
+    --disk_cache=${BAZEL_DISK_CACHE} \
     //binaries:emulator_main \
     //binaries:gateway_main
 

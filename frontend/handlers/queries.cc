@@ -28,12 +28,23 @@
 #include "google/spanner/v1/spanner.pb.h"
 #include "google/spanner/v1/transaction.pb.h"
 #include "googlesql/public/analyzer_options.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/cord.h"
+#include "absl/strings/match.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "absl/types/optional.h"
 #include "absl/types/variant.h"
 #include "backend/access/read.h"
+#include "backend/database/database.h"
+#include "backend/storage/storage.h"
+#include "frontend/collections/operation_manager.h"
+#include "frontend/collections/session_manager.h"
 #include "backend/query/change_stream/change_stream_query_validator.h"
 #include "backend/query/query_engine.h"
 #include "common/constants.h"
@@ -45,6 +56,7 @@
 #include "frontend/converters/reads.h"
 #include "frontend/converters/types.h"
 #include "frontend/converters/values.h"
+#include "frontend/entities/database.h"
 #include "frontend/entities/session.h"
 #include "frontend/entities/transaction.h"
 #include "frontend/handlers/change_streams.h"
@@ -216,6 +228,247 @@ int64_t HashRequest(const spanner_api::ExecuteBatchDmlRequest* request) {
   return SerializeAndHashRequest(copy);
 }
 
+// Emulator-only escape hatch: SELECT EMULATOR_RECLAIM('T1', 'T2')
+//
+// Cloud Spanner reclaims storage in the background; the emulator does not, so
+// a long-lived container grows for its whole lifetime. This lets a local test
+// harness reclaim between batches instead of restarting the container.
+//
+// Recognised only as a whole statement, so it cannot collide with a real query
+// or a column named similarly. With no arguments it sweeps the whole database.
+constexpr char kReclaimPrefix[] = "SELECT EMULATOR_RECLAIM(";
+
+bool IsEmulatorReclaimStatement(absl::string_view sql) {
+  return absl::StartsWithIgnoreCase(absl::StripAsciiWhitespace(sql),
+                                    kReclaimPrefix);
+}
+
+// Splits the argument list into its comma-separated arguments, ignoring commas
+// inside quotes. Returns the text between the outermost parentheses.
+std::vector<std::string> SplitReclaimArguments(absl::string_view sql) {
+  absl::string_view rest = absl::StripAsciiWhitespace(sql);
+  rest.remove_prefix(sizeof(kReclaimPrefix) - 1);
+  size_t close_paren = rest.rfind(')');
+  if (close_paren != absl::string_view::npos) {
+    rest = rest.substr(0, close_paren);
+  }
+
+  std::vector<std::string> arguments;
+  bool in_quotes = false;
+  size_t start = 0;
+  for (size_t i = 0; i < rest.size(); ++i) {
+    if (rest[i] == '\'') {
+      in_quotes = !in_quotes;
+    } else if (rest[i] == ',' && !in_quotes) {
+      arguments.emplace_back(absl::StripAsciiWhitespace(
+          rest.substr(start, i - start)));
+      start = i + 1;
+    }
+  }
+  absl::string_view last = absl::StripAsciiWhitespace(rest.substr(start));
+  if (!last.empty()) arguments.emplace_back(last);
+  return arguments;
+}
+
+// True for a named argument of the form `name => value`.
+bool IsNamedArgument(absl::string_view argument, absl::string_view name) {
+  size_t arrow = argument.find("=>");
+  if (arrow == absl::string_view::npos) return false;
+  return absl::EqualsIgnoreCase(
+      absl::StripAsciiWhitespace(argument.substr(0, arrow)), name);
+}
+
+// The value of a named argument, with its surrounding quotes removed.
+std::string NamedArgumentValue(absl::string_view argument) {
+  absl::string_view value =
+      absl::StripAsciiWhitespace(argument.substr(argument.find("=>") + 2));
+  if (value.size() >= 2 && value.front() == '\'' && value.back() == '\'') {
+    value = value.substr(1, value.size() - 2);
+  }
+  return std::string(value);
+}
+
+// Extracts the single-quoted table names from the argument list, skipping the
+// named arguments. Returns an empty vector for EMULATOR_RECLAIM(), meaning
+// "the whole database".
+std::vector<std::string> ParseReclaimTableNames(absl::string_view sql) {
+  std::vector<std::string> table_names;
+  for (const std::string& argument : SplitReclaimArguments(sql)) {
+    if (argument.find("=>") != std::string::npos) continue;
+    absl::string_view name = argument;
+    if (name.size() >= 2 && name.front() == '\'' && name.back() == '\'') {
+      name = name.substr(1, name.size() - 2);
+    }
+    if (!name.empty()) table_names.emplace_back(name);
+  }
+  return table_names;
+}
+
+// Reads the optional window bounds:
+//
+//   not_before    => '2026-09-03T19:00:00Z'   protect everything seeded earlier
+//   not_after     => '2026-09-03T20:00:00Z'   absolute upper bound
+//   not_after_lag => '60s'                    upper bound relative to now
+//
+// not_after_lag is the useful form for a long run: it keeps the newest minute
+// of writes safe no matter how long the suite takes. Absent bounds leave the
+// retention behaviour untouched.
+// True when the caller passed delete_rows => true, opting in to erasing live
+// rows whose commit timestamp falls inside the window.
+bool ParseReclaimDeleteRows(absl::string_view sql) {
+  for (const std::string& argument : SplitReclaimArguments(sql)) {
+    if (IsNamedArgument(argument, "delete_rows") &&
+        absl::EqualsIgnoreCase(NamedArgumentValue(argument), "true")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// True when the caller passed prune_sessions => true.
+bool ParseReclaimPruneSessions(absl::string_view sql) {
+  for (const std::string& argument : SplitReclaimArguments(sql)) {
+    if (IsNamedArgument(argument, "prune_sessions") &&
+        absl::EqualsIgnoreCase(NamedArgumentValue(argument), "true")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// True when the caller passed prune_operations => true.
+bool ParseReclaimPruneOperations(absl::string_view sql) {
+  for (const std::string& argument : SplitReclaimArguments(sql)) {
+    if (IsNamedArgument(argument, "prune_operations") &&
+        absl::EqualsIgnoreCase(NamedArgumentValue(argument), "true")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+absl::StatusOr<backend::PurgeWindow> ParseReclaimWindow(absl::string_view sql,
+                                                        absl::Time now) {
+  backend::PurgeWindow window;
+  for (const std::string& argument : SplitReclaimArguments(sql)) {
+    absl::Time parsed;
+    std::string error;
+    if (IsNamedArgument(argument, "not_before") ||
+        IsNamedArgument(argument, "not_after")) {
+      const std::string value = NamedArgumentValue(argument);
+      if (!absl::ParseTime(absl::RFC3339_full, value, &parsed, &error)) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "EMULATOR_RECLAIM: could not parse timestamp \"", value,
+            "\": ", error));
+      }
+      if (IsNamedArgument(argument, "not_before")) {
+        window.not_before = parsed;
+      } else {
+        window.not_after = parsed;
+      }
+    } else if (IsNamedArgument(argument, "not_after_lag")) {
+      const std::string value = NamedArgumentValue(argument);
+      absl::Duration lag;
+      if (!absl::ParseDuration(value, &lag)) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "EMULATOR_RECLAIM: could not parse duration \"", value, "\""));
+      }
+      window.not_after = now - lag;
+    }
+  }
+  if (window.not_before.has_value() && window.not_after.has_value() &&
+      *window.not_before >= *window.not_after) {
+    return absl::InvalidArgumentError(
+        "EMULATOR_RECLAIM: not_before must be earlier than not_after");
+  }
+  return window;
+}
+
+// Answers the reclaim statement with a one-row, one-column INT64 result set
+// holding the number of purged rows.
+absl::Status HandleEmulatorReclaim(RequestContext* ctx,
+                                   std::shared_ptr<Session> session,
+                                   absl::string_view sql,
+                                   spanner_api::ResultSet* response) {
+  // Session::database() hands back the frontend wrapper; ReclaimStorage lives on
+  // the backend database it holds.
+  // The statement verbatim, so the log shows what was asked for even if an
+  // argument was mistyped and silently ignored.
+  ABSL_LOG(INFO) << "[reclaim] statement: " << sql;
+
+  GOOGLESQL_ASSIGN_OR_RETURN(backend::PurgeWindow window,
+                   ParseReclaimWindow(sql, absl::Now()));
+  const bool delete_rows = ParseReclaimDeleteRows(sql);
+  // An unbounded destructive sweep would erase every live row in scope, which
+  // is never what a harness means. Require a bound rather than doing it.
+  if (delete_rows && !window.not_before.has_value() &&
+      !window.not_after.has_value()) {
+    return absl::InvalidArgumentError(
+        "EMULATOR_RECLAIM: delete_rows requires not_before, not_after or "
+        "not_after_lag -- refusing to erase every live row");
+  }
+  GOOGLESQL_ASSIGN_OR_RETURN(backend::Database::ReclaimStats stats,
+                   session->database()->backend()->ReclaimStorage(
+                       ParseReclaimTableNames(sql), window, delete_rows));
+
+  // Sessions are frontend state, so they are swept here rather than in the
+  // backend. A session not used since the window's upper bound cannot be in
+  // use by a running test, and an already-expired session is unusable anyway --
+  // GetSession() reports it as not found -- so this only frees dead memory.
+  int64_t sessions_pruned = 0;
+  if (ParseReclaimPruneSessions(sql)) {
+    const absl::Time not_used_since =
+        window.not_after.value_or(absl::Now() - absl::Hours(1));
+    sessions_pruned =
+        ctx->env()->session_manager()->PruneSessionsNotUsedSince(
+            not_used_since);
+    // Logged in the container so a harness run can be diagnosed from the log
+    // alone; the CLI's own output is gone once the caller exits.
+    ABSL_LOG(INFO) << "[reclaim] prune_sessions not_used_since="
+                   << absl::FormatTime(absl::RFC3339_full, not_used_since,
+                                       absl::UTCTimeZone())
+                   << ", sessions_pruned=" << sessions_pruned;
+  }
+
+  // Operations are created per CreateDatabase and UpdateDdl and removed only by
+  // an explicit DeleteOperation, so schema churn accumulates them. Only
+  // completed ones are pruned; there is no window, because a completed
+  // operation is finished work regardless of when it ran.
+  int64_t operations_pruned = 0;
+  if (ParseReclaimPruneOperations(sql)) {
+    operations_pruned =
+        ctx->env()->operation_manager()->PruneCompletedOperations();
+    ABSL_LOG(INFO) << "[reclaim] prune_operations completed_only=true"
+                   << ", operations_pruned=" << operations_pruned;
+  }
+
+  auto* row_type = response->mutable_metadata()->mutable_row_type();
+  auto* rows_field = row_type->add_fields();
+  rows_field->set_name("rows_purged");
+  rows_field->mutable_type()->set_code(google::spanner::v1::TypeCode::INT64);
+  auto* versions_field = row_type->add_fields();
+  versions_field->set_name("versions_purged");
+  versions_field->mutable_type()->set_code(google::spanner::v1::TypeCode::INT64);
+  auto* deleted_field = row_type->add_fields();
+  deleted_field->set_name("rows_deleted");
+  deleted_field->mutable_type()->set_code(google::spanner::v1::TypeCode::INT64);
+  auto* sessions_field = row_type->add_fields();
+  sessions_field->set_name("sessions_pruned");
+  sessions_field->mutable_type()->set_code(google::spanner::v1::TypeCode::INT64);
+  auto* operations_field = row_type->add_fields();
+  operations_field->set_name("operations_pruned");
+  operations_field->mutable_type()->set_code(
+      google::spanner::v1::TypeCode::INT64);
+
+  auto* row = response->add_rows();
+  row->add_values()->set_string_value(absl::StrCat(stats.rows_purged));
+  row->add_values()->set_string_value(absl::StrCat(stats.versions_purged));
+  row->add_values()->set_string_value(absl::StrCat(stats.rows_deleted));
+  row->add_values()->set_string_value(absl::StrCat(sessions_pruned));
+  row->add_values()->set_string_value(absl::StrCat(operations_pruned));
+  return absl::OkStatus();
+}
+
 }  //  namespace
 
 // Executes a SQL statement, returning all results in a single reply.
@@ -226,6 +479,12 @@ absl::Status ExecuteSql(RequestContext* ctx,
   // valid throughout this function.
   GOOGLESQL_ASSIGN_OR_RETURN(std::shared_ptr<Session> session,
                    GetSession(ctx, request->session()));
+
+  // Emulator-only storage reclamation. Handled before transaction setup and
+  // query planning: it is not a real query and takes no transaction.
+  if (IsEmulatorReclaimStatement(request->sql())) {
+    return HandleEmulatorReclaim(ctx, session, request->sql(), response);
+  }
 
   // Get underlying transaction.
   bool is_dml_query = backend::IsDMLQuery(request->sql());

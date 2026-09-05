@@ -108,6 +108,26 @@ SessionManager::ListSessions(const std::string& database_uri,
   return sessions;
 }
 
+int64_t SessionManager::PruneSessionsNotUsedSince(absl::Time not_used_since,
+                                                  bool prune_multiplexed) {
+  absl::MutexLock lock(mu_);
+  int64_t pruned = 0;
+  for (auto itr = session_map_.begin(); itr != session_map_.end();) {
+    const std::shared_ptr<Session>& session = itr->second;
+    if (session->multiplexed() && !prune_multiplexed) {
+      ++itr;
+      continue;
+    }
+    if (session->approximate_last_use_time() >= not_used_since) {
+      ++itr;
+      continue;
+    }
+    itr = session_map_.erase(itr);
+    ++pruned;
+  }
+  return pruned;
+}
+
 absl::Status SessionManager::DeleteSession(const std::string& session_uri,
                                            bool delete_multiplex_sessions) {
   absl::MutexLock lock(mu_);

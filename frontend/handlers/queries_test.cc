@@ -1351,6 +1351,213 @@ TEST_P(QueryApiTest, DirectedReadsWithRWTxnFails) {
   }
 }
 
+
+// EMULATOR_RECLAIM -- the emulator-only reclamation statement.
+//
+// These drive the real gRPC path, so they cover the argument parsing and the
+// sweep together. The parsing is hand-rolled string handling, and a dropped
+// bound fails silently: the sweep still returns counts and looks successful
+// while having purged data the caller asked to protect. That is what these
+// assert against.
+
+// The statement answers with three INT64 counters.
+TEST_P(QueryApiTest, EmulatorReclaimReturnsCounters) {
+  spanner_api::ExecuteSqlRequest request;
+  request.set_sql(
+      "SELECT EMULATOR_RECLAIM()");
+  request.set_session(
+      GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
+
+  spanner_api::ResultSet response;
+  GOOGLESQL_ASSERT_OK(ExecuteSql(request, &response));
+  EXPECT_THAT(response, Partially(EqualsProto(
+                            R"pb(
+                              metadata {
+                                row_type {
+                                  fields {
+                                    name: "rows_purged"
+                                    type { code: INT64 }
+                                  }
+                                  fields {
+                                    name: "versions_purged"
+                                    type { code: INT64 }
+                                  }
+                                  fields {
+                                    name: "rows_deleted"
+                                    type { code: INT64 }
+                                  }
+                                  fields {
+                                    name: "sessions_pruned"
+                                    type { code: INT64 }
+                                  }
+                                  fields {
+                                    name: "operations_pruned"
+                                    type { code: INT64 }
+                                  }
+                                }
+                              }
+                            )pb")));
+  ASSERT_EQ(response.rows_size(), 1);
+  EXPECT_EQ(response.rows(0).values_size(), 5);
+}
+
+// Table names still parse now that named arguments share the argument list.
+TEST_P(QueryApiTest, EmulatorReclaimAcceptsTableNames) {
+  spanner_api::ExecuteSqlRequest request;
+  request.set_sql(
+      "SELECT EMULATOR_RECLAIM('test_table')");
+  request.set_session(
+      GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
+
+  spanner_api::ResultSet response;
+  GOOGLESQL_ASSERT_OK(ExecuteSql(request, &response));
+  ASSERT_EQ(response.rows_size(), 1);
+}
+
+// A table name mixed with named arguments: the splitter must keep them apart.
+TEST_P(QueryApiTest, EmulatorReclaimAcceptsTableNameWithNamedArguments) {
+  spanner_api::ExecuteSqlRequest request;
+  request.set_sql(
+      "SELECT EMULATOR_RECLAIM('test_table', not_after_lag => '60s')");
+  request.set_session(
+      GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
+
+  spanner_api::ResultSet response;
+  GOOGLESQL_ASSERT_OK(ExecuteSql(request, &response));
+  ASSERT_EQ(response.rows_size(), 1);
+}
+
+// The bounds are accepted and parsed rather than silently ignored.
+TEST_P(QueryApiTest, EmulatorReclaimAcceptsWindowBounds) {
+  spanner_api::ExecuteSqlRequest request;
+  request.set_sql(
+      "SELECT EMULATOR_RECLAIM(not_before => '2020-01-01T00:00:00Z', not_after_lag => '60s')");
+  request.set_session(
+      GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
+
+  spanner_api::ResultSet response;
+  GOOGLESQL_ASSERT_OK(ExecuteSql(request, &response));
+  ASSERT_EQ(response.rows_size(), 1);
+}
+
+// A malformed timestamp is rejected, not treated as "no bound". Accepting it
+// silently would purge everything the bound was meant to protect.
+TEST_P(QueryApiTest, EmulatorReclaimRejectsUnparseableTimestamp) {
+  spanner_api::ExecuteSqlRequest request;
+  request.set_sql(
+      "SELECT EMULATOR_RECLAIM(not_before => 'not-a-timestamp')");
+  request.set_session(
+      GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
+
+  spanner_api::ResultSet response;
+  EXPECT_THAT(ExecuteSql(request, &response),
+              googlesql_base::testing::StatusIs(
+                  absl::StatusCode::kInvalidArgument));
+}
+
+TEST_P(QueryApiTest, EmulatorReclaimRejectsUnparseableDuration) {
+  spanner_api::ExecuteSqlRequest request;
+  request.set_sql(
+      "SELECT EMULATOR_RECLAIM(not_after_lag => 'not-a-duration')");
+  request.set_session(
+      GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
+
+  spanner_api::ResultSet response;
+  EXPECT_THAT(ExecuteSql(request, &response),
+              googlesql_base::testing::StatusIs(
+                  absl::StatusCode::kInvalidArgument));
+}
+
+// An inverted window is a caller mistake, not an empty sweep.
+TEST_P(QueryApiTest, EmulatorReclaimRejectsInvertedWindow) {
+  spanner_api::ExecuteSqlRequest request;
+  request.set_sql(
+      "SELECT EMULATOR_RECLAIM(not_before => '2030-01-01T00:00:00Z', not_after => '2020-01-01T00:00:00Z')");
+  request.set_session(
+      GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
+
+  spanner_api::ResultSet response;
+  EXPECT_THAT(ExecuteSql(request, &response),
+              googlesql_base::testing::StatusIs(
+                  absl::StatusCode::kInvalidArgument));
+}
+
+// delete_rows erases live rows, so an unbounded request would empty the
+// database. It must be refused rather than obeyed.
+TEST_P(QueryApiTest, EmulatorReclaimRejectsUnboundedDeleteRows) {
+  spanner_api::ExecuteSqlRequest request;
+  request.set_sql(
+      "SELECT EMULATOR_RECLAIM(delete_rows => true)");
+  request.set_session(
+      GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
+
+  spanner_api::ResultSet response;
+  EXPECT_THAT(ExecuteSql(request, &response),
+              googlesql_base::testing::StatusIs(
+                  absl::StatusCode::kInvalidArgument));
+}
+
+// Bounded delete_rows is allowed.
+TEST_P(QueryApiTest, EmulatorReclaimAcceptsBoundedDeleteRows) {
+  spanner_api::ExecuteSqlRequest request;
+  request.set_sql(
+      "SELECT EMULATOR_RECLAIM(not_before => '2020-01-01T00:00:00Z', delete_rows => true)");
+  request.set_session(
+      GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
+
+  spanner_api::ResultSet response;
+  GOOGLESQL_ASSERT_OK(ExecuteSql(request, &response));
+  ASSERT_EQ(response.rows_size(), 1);
+}
+
+// The end-to-end guarantee the seeding workflow depends on: rows committed
+// before not_before survive a destructive sweep. test_table is populated by the
+// fixture before the run, so it stands in for seed data here.
+TEST_P(QueryApiTest, EmulatorReclaimKeepsRowsCommittedBeforeNotBefore) {
+  spanner_api::ExecuteSqlRequest reclaim;
+  reclaim.set_sql(
+      "SELECT EMULATOR_RECLAIM(not_before => '2030-01-01T00:00:00Z', delete_rows => true)");
+  reclaim.set_session(
+      GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
+  spanner_api::ResultSet reclaim_response;
+  GOOGLESQL_ASSERT_OK(ExecuteSql(reclaim, &reclaim_response));
+
+  // Everything was committed before that bound, so nothing may have been
+  // deleted and the rows must still read back.
+  ASSERT_EQ(reclaim_response.rows_size(), 1);
+  EXPECT_EQ(reclaim_response.rows(0).values(2).string_value(), "0");
+
+  spanner_api::ExecuteSqlRequest select = PARSE_TEXT_PROTO(
+      R"(
+        transaction { single_use { read_only { strong: true } } }
+        sql: "SELECT COUNT(*) FROM test_table"
+      )");
+  select.set_session(
+      GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
+  spanner_api::ResultSet select_response;
+  GOOGLESQL_ASSERT_OK(ExecuteSql(select, &select_response));
+  ASSERT_EQ(select_response.rows_size(), 1);
+  EXPECT_NE(select_response.rows(0).values(0).string_value(), "0");
+}
+
+
+// prune_sessions releases abandoned sessions, which the row sweeps cannot
+// reach: sessions are frontend state, not storage.
+TEST_P(QueryApiTest, EmulatorReclaimPrunesSessions) {
+  spanner_api::ExecuteSqlRequest request;
+  request.set_sql(
+      "SELECT EMULATOR_RECLAIM(not_before => '1970-01-01T00:00:00Z', prune_sessions => true)");
+  request.set_session(
+      GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
+
+  spanner_api::ResultSet response;
+  GOOGLESQL_ASSERT_OK(ExecuteSql(request, &response));
+  ASSERT_EQ(response.rows_size(), 1);
+  // Five counters: rows_purged, versions_purged, rows_deleted,
+  // sessions_pruned, operations_pruned.
+  EXPECT_EQ(response.rows(0).values_size(), 5);
+}
+
 }  // namespace
 
 }  // namespace frontend

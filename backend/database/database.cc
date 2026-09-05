@@ -16,9 +16,16 @@
 
 #include "backend/database/database.h"
 
+#include <cstdint>
 #include <memory>
+#include <string>
 #include <thread>  // NOLINT
 #include <utility>
+#include <vector>
+
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 #include "google/spanner/admin/database/v1/common.pb.h"
 #include "googlesql/public/types/type_factory.h"
@@ -26,6 +33,9 @@
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/log/log.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -36,8 +46,10 @@
 #include "backend/database/pg_oid_assigner/pg_oid_assigner.h"
 #include "backend/locking/manager.h"
 #include "backend/query/query_engine.h"
+#include "backend/schema/catalog/index.h"
 #include "backend/schema/catalog/proto_bundle.h"
 #include "backend/schema/catalog/schema.h"
+#include "backend/schema/catalog/table.h"
 #include "backend/schema/catalog/versioned_catalog.h"
 #include "backend/schema/graph/schema_graph.h"
 #include "backend/schema/updater/schema_updater.h"
@@ -55,6 +67,28 @@ namespace google {
 namespace spanner {
 namespace emulator {
 namespace backend {
+
+namespace {
+
+// Bytes currently handed out by the allocator. glibc-specific; other platforms
+// report 0, which the log renders as a zero delta rather than a wrong number.
+int64_t HeapBytesInUse() {
+#ifdef __GLIBC__
+  // mallinfo2 is the 64-bit-safe form; mallinfo() truncates above 2 GB, which
+  // is exactly the range this logging exists to observe.
+  struct mallinfo2 info = mallinfo2();
+  return static_cast<int64_t>(info.uordblks);
+#else
+  return 0;
+#endif
+}
+
+// Bytes as MiB, one decimal place, for log readability.
+double MiB(int64_t bytes) {
+  return static_cast<double>(bytes) / (1024.0 * 1024.0);
+}
+
+}  // namespace
 
 // TransactionIDGenerator is initialized to 1 because 0 is used as a sentinel
 // value for an invalid transaction.
@@ -212,6 +246,114 @@ absl::Status Database::UpdateSchema(
 
 const Schema* Database::GetLatestSchema() const {
   return versioned_catalog_->GetLatestSchema();
+}
+
+absl::StatusOr<Database::ReclaimStats> Database::ReclaimStorage(
+    const std::vector<std::string>& table_names, const PurgeWindow& window,
+    bool delete_rows_in_window) {
+  const absl::Time now = clock_->Now();
+
+  // Resolve names to storage TableIDs. An index keeps its rows in its own data
+  // table, so sweeping a table also sweeps the indexes defined on it.
+  std::vector<TableID> table_ids;
+  const Schema* schema = versioned_catalog_->GetLatestSchema();
+  for (const std::string& table_name : table_names) {
+    const Table* table = schema->FindTable(table_name);
+    if (table == nullptr) {
+      // Ignored rather than rejected: a harness sweeping a fixed list should
+      // not break when a table is renamed or dropped.
+      continue;
+    }
+    table_ids.push_back(table->id());
+    for (const Index* index : table->indexes()) {
+      if (index->index_data_table() != nullptr) {
+        table_ids.push_back(index->index_data_table()->id());
+      }
+    }
+  }
+
+  const std::string scope =
+      table_names.empty()
+          ? "whole database"
+          : absl::StrCat(table_names.size(), " table(s): ",
+                         absl::StrJoin(table_names, ", "));
+  // The bounds decide which data survives, so they belong in the log next to
+  // the counts. Without them a run that erased seed data is indistinguishable
+  // from one that protected it.
+  const std::string bounds = absl::StrCat(
+      "not_before=",
+      window.not_before.has_value()
+          ? absl::FormatTime(absl::RFC3339_full, *window.not_before,
+                             absl::UTCTimeZone())
+          : "<unset>",
+      ", not_after=",
+      window.not_after.has_value()
+          ? absl::FormatTime(absl::RFC3339_full, *window.not_after,
+                             absl::UTCTimeZone())
+          : absl::StrCat("<unset, using retention period> (effective ",
+                         absl::FormatTime(absl::RFC3339_full,
+                                          now - versioned_catalog_->version_retention_period(),
+                                          absl::UTCTimeZone()),
+                         ")"));
+
+  ABSL_LOG(INFO) << "[reclaim] database=" << database_id_ << " start, scope=" << scope
+                 << ", resolved " << table_ids.size() << " storage table(s)"
+                 << ", " << bounds
+                 << ", delete_rows=" << (delete_rows_in_window ? "true" : "false");
+
+  if (delete_rows_in_window && !window.not_before.has_value()) {
+    ABSL_LOG(WARNING)
+        << "[reclaim] database=" << database_id_
+        << " delete_rows without not_before: every live row older than "
+           "not_after is eligible, including anything seeded before this run";
+  }
+
+  const int64_t heap_before = HeapBytesInUse();
+
+  ReclaimStats stats;
+  // Destructive sweep first: deleting a live row removes its versions too, so
+  // running it first leaves the purge sweeps less to walk.
+  if (delete_rows_in_window) {
+    stats.rows_deleted = storage_->DeleteRowsInWindow(now, table_ids, window);
+  }
+  stats.rows_purged = storage_->PurgeExpiredDeletedRows(now, table_ids, window);
+  stats.versions_purged =
+      storage_->PurgeExpiredVersions(now, table_ids, window);
+
+  // Dropped tables and columns are otherwise reclaimed only on a schema change
+  // or a read-only transaction, so an idle database never runs them. Both are
+  // idempotent and no-op once their backlog is drained.
+  storage_->CleanUpDeletedTables(now);
+  storage_->CleanUpDeletedColumns(now);
+
+  const int64_t heap_after_purge = HeapBytesInUse();
+
+#ifdef __GLIBC__
+  // Erasing from the storage maps returns nodes to the allocator's free lists,
+  // not to the OS, so RSS does not drop on its own. Ask glibc to release what
+  // it can; heap fragmentation limits how much is actually returnable.
+  malloc_trim(0);
+#endif
+
+  const int64_t heap_after_trim = HeapBytesInUse();
+
+  // Logged so an operator can confirm from the container log that reclamation
+  // actually ran and what it recovered, without having to correlate against
+  // external RSS samples. heap_* is the allocator's own accounting: the purge
+  // delta shows what the engine freed, the trim delta what glibc handed back to
+  // the OS. The two are different questions and both matter.
+  ABSL_LOG(INFO) << "[reclaim] database=" << database_id_ << " done"
+                 << ", rows_deleted=" << stats.rows_deleted
+                 << ", rows_purged=" << stats.rows_purged
+                 << ", versions_purged=" << stats.versions_purged
+                 << ", heap_before=" << MiB(heap_before) << " MiB"
+                 << ", after_purge=" << MiB(heap_after_purge) << " MiB"
+                 << " (freed " << MiB(heap_before - heap_after_purge) << " MiB)"
+                 << ", after_trim=" << MiB(heap_after_trim) << " MiB"
+                 << " (returned " << MiB(heap_after_purge - heap_after_trim)
+                 << " MiB to the OS)";
+
+  return stats;
 }
 
 }  // namespace backend

@@ -279,7 +279,96 @@ TEST_F(SessionManagerTest, ListSessionsWithSimilarPrefix) {
   }
 }
 
+// PruneSessionsNotUsedSince -- reclaiming abandoned sessions.
+//
+// Expiry is otherwise lazy: GetSession() erases an expired session only when it
+// is looked up again, and ListSessions() filters expired sessions out of its
+// response while leaving them in the map. A harness that abandons sessions
+// therefore holds every one of them, and its retained transactions, for the
+// life of the process.
+
+TEST_F(SessionManagerTest, PruneRemovesSessionNotUsedSinceBound) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Session> session,
+      session_manager_.CreateSession(test_labels_, /*multiplexed=*/false,
+                                     database_, /*mux_txn_manager=*/nullptr));
+  const std::string uri = session->session_uri();
+
+  // Bound in the future: the session was last used before it.
+  EXPECT_EQ(session_manager_.PruneSessionsNotUsedSince(absl::Now() + absl::Hours(1)),
+            1);
+  EXPECT_THAT(session_manager_.GetSession(uri),
+              googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST_F(SessionManagerTest, PruneKeepsRecentlyUsedSession) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Session> session,
+      session_manager_.CreateSession(test_labels_, /*multiplexed=*/false,
+                                     database_, /*mux_txn_manager=*/nullptr));
+  const std::string uri = session->session_uri();
+
+  // Bound in the past: the session has been used since, so it stays.
+  EXPECT_EQ(session_manager_.PruneSessionsNotUsedSince(absl::Now() - absl::Hours(1)),
+            0);
+  GOOGLESQL_EXPECT_OK(session_manager_.GetSession(uri));
+}
+
+TEST_F(SessionManagerTest, PruneLeavesMultiplexedSessionsByDefault) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Session> session,
+      session_manager_.CreateSession(test_labels_, /*multiplexed=*/true,
+                                     database_, /*mux_txn_manager=*/nullptr));
+  const std::string uri = session->session_uri();
+
+  // A multiplexed session expires after 28 days and a client keeps using one,
+  // so the default sweep must not touch it.
+  EXPECT_EQ(session_manager_.PruneSessionsNotUsedSince(absl::Now() + absl::Hours(1)),
+            0);
+  GOOGLESQL_EXPECT_OK(session_manager_.GetSession(uri));
+
+  // ...unless it is asked for explicitly.
+  EXPECT_EQ(session_manager_.PruneSessionsNotUsedSince(absl::Now() + absl::Hours(1),
+                                               /*prune_multiplexed=*/true),
+            1);
+}
+
+TEST_F(SessionManagerTest, PruneIsIdempotent) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Session> session,
+      session_manager_.CreateSession(test_labels_, /*multiplexed=*/false,
+                                     database_, /*mux_txn_manager=*/nullptr));
+
+  EXPECT_EQ(session_manager_.PruneSessionsNotUsedSince(absl::Now() + absl::Hours(1)),
+            1);
+  EXPECT_EQ(session_manager_.PruneSessionsNotUsedSince(absl::Now() + absl::Hours(1)),
+            0);
+}
+
+TEST_F(SessionManagerTest, PruneRemovesOnlyTheSessionsPastTheBound) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Session> old_session,
+      session_manager_.CreateSession(test_labels_, /*multiplexed=*/false,
+                                     database_, /*mux_txn_manager=*/nullptr));
+  const std::string old_uri = old_session->session_uri();
+  const absl::Time bound = absl::Now() + absl::Minutes(1);
+  old_session->set_approximate_last_use_time(bound - absl::Minutes(10));
+
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Session> new_session,
+      session_manager_.CreateSession(test_labels_, /*multiplexed=*/false,
+                                     database_, /*mux_txn_manager=*/nullptr));
+  const std::string new_uri = new_session->session_uri();
+  new_session->set_approximate_last_use_time(bound + absl::Minutes(10));
+
+  EXPECT_EQ(session_manager_.PruneSessionsNotUsedSince(bound), 1);
+  EXPECT_THAT(session_manager_.GetSession(old_uri),
+              googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
+  GOOGLESQL_EXPECT_OK(session_manager_.GetSession(new_uri));
+}
+
 }  // namespace frontend
 }  // namespace emulator
 }  // namespace spanner
+
 }  // namespace google
