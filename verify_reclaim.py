@@ -193,8 +193,17 @@ def main():
     print("  Session pruning")
     for _ in range(20):
         post(root, f"{databases}/{DATABASE}/sessions", {})
+    # Session pruning keys off NOT_AFTER, not not_before: it erases sessions not
+    # used since that instant, defaulting to now-1h when the bound is absent.
+    # The scenario previously sent only not_before, so the cutoff stayed at
+    # now-1h and these seconds-old sessions were correctly kept -- the test was
+    # asking the wrong question. A far-future not_after makes every session
+    # older than the cutoff.
+    #
+    # not_after alone would also make every live row eligible for delete_rows,
+    # which is why that flag is deliberately not set here.
     pruned = post(root, f"{session}:executeSql", {
-        "sql": ("SELECT EMULATOR_RECLAIM(not_before => '1970-01-01T00:00:00Z', "
+        "sql": ("SELECT EMULATOR_RECLAIM(not_after => '2999-01-01T00:00:00Z', "
                 "prune_sessions => true)")})
     sessions_pruned = int(pruned["rows"][0][3])
     print(f"    sessions pruned         : {sessions_pruned}")
