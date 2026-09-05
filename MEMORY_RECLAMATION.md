@@ -103,11 +103,11 @@ A harness that seeds a database before a run must protect that seed data. Seed
 data is the **oldest** data present, so an unbounded sweep reaches it *first*.
 
 ```bash
-# Capture the boundary AFTER seeding finishes, and after a one-second pause:
-# `date` gives whole seconds, truncated downward, so a value taken in the same
-# second as the last seed commit lands BEFORE it, and that second's seed rows
-# would be classified as churn and deleted. Then start test traffic.
-sleep 1
+# Capture the boundary once seeding has finished, before any test traffic.
+# `date` gives whole seconds; reclaim.sh rounds such a value UP to the end of
+# its second, so seed rows committed later in the same second are kept rather
+# than classified as churn. (Only the kept set can grow -- at worst the first
+# second of test rows survives one sweep.)
 SEED_DONE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 # Then, between test batches:

@@ -13,11 +13,13 @@
 #   ./reclaim.sh --host spanner-box:9020 --project my-proj --instance my-inst --all
 #
 # Seeded databases -- protect the seed data and the newest writes. Capture the
-# boundary AFTER seeding has finished and a one-second pause: a whole-second
-# timestamp is truncated downward, so one taken in the same second as the last
-# seed commit lands before it and that second's seed rows count as churn.
-#   sleep 1; SEED_DONE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# boundary once seeding has finished:
+#   SEED_DONE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 #   ./reclaim.sh --all --not-before "$SEED_DONE" --not-after-lag 60s
+# A whole-second value is rounded UP to the end of its second before it is
+# sent, so seed rows committed later in the same second are kept rather than
+# treated as churn (only the kept set can grow; nothing is ever deleted by the
+# rounding).
 #
 # --delete-rows additionally erases LIVE rows whose commit timestamp falls inside
 # the window -- rows a test inserted and never deleted. The sweeps above only
@@ -195,6 +197,16 @@ print(payload["name"])')" || die "database \"${database}\" not found on ${PROJEC
   args=""
   for table in ${TABLES+"${TABLES[@]}"}; do args+="${args:+, }'${table}'"; done
   if [[ -n "$NOT_BEFORE" ]]; then
+    # A whole-second timestamp is truncated downward, so one captured in the
+    # same second as the last seed commit lands BEFORE it and that second's
+    # seed rows would be classified as churn. Round a whole-second value up to
+    # the end of its second. This only ever enlarges the KEPT set -- at worst
+    # the first second of test rows survives one sweep -- so it can never
+    # delete seed data, and it removes the need to pause before capturing.
+    if [[ "$NOT_BEFORE" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(Z|[+-][0-9]{2}:[0-9]{2})$ ]]; then
+      NOT_BEFORE="${BASH_REMATCH[1]}.999999${BASH_REMATCH[2]}"
+      echo "reclaim: not_before  rounded up to ${NOT_BEFORE} (whole-second input; seed rows in that second are kept)"
+    fi
     args+="${args:+, }not_before => '${NOT_BEFORE}'"
   fi
   if [[ -n "$NOT_AFTER_LAG" ]]; then
