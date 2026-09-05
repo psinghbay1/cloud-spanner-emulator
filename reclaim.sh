@@ -132,7 +132,13 @@ if [[ "$LIST" == true ]]; then
 fi
 
 if [[ "$ALL" == true ]]; then
-  mapfile -t DATABASES < <(list_databases)
+  # Not mapfile: that is bash 4+, and macOS ships bash 3.2, so --all failed
+  # there with "mapfile: command not found" -- on exactly the machines the
+  # docs call the developer platform.
+  DATABASES=()
+  while IFS= read -r database_name; do
+    [[ -n "$database_name" ]] && DATABASES+=("$database_name")
+  done < <(list_databases)
   [[ ${#DATABASES[@]} -gt 0 ]] || die "no databases found on ${PROJECT}/${INSTANCE}"
   TABLES=()
 else
