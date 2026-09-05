@@ -67,8 +67,12 @@ def count_rows(root, session, table="T"):
 
 
 def now_rfc3339():
+    """Current time with microseconds. A whole-second timestamp is truncated
+    DOWNWARD, which puts the boundary before any commit made later in the same
+    second -- and seeding 500 rows over REST finishes well inside one second,
+    so every seed row written in that final second was classified as churn."""
     return datetime.datetime.now(datetime.timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%SZ")
+        "%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def main():
@@ -153,8 +157,12 @@ def main():
 
     seed_rows = 500
     write_rows(root, session, 0, seed_rows, "S", table="Seeded")
+    # The boundary must be STRICTLY after the last seed commit. Pause first so
+    # that holds even against clock granularity, then capture with full
+    # precision; the same rule the reclaim.sh recipe documents.
+    time.sleep(1)
     seed_done = now_rfc3339()
-    time.sleep(2)  # let the seed rows age past the boundary
+    time.sleep(1)  # and the test rows must land strictly after the boundary
     write_rows(root, session, seed_rows, seed_rows + 500, "T", table="Seeded")
 
     before = int(count_rows(root, session, table="Seeded"))

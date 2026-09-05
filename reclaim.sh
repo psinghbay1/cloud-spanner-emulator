@@ -12,7 +12,11 @@
 #   ./reclaim.sh --host localhost:9021 --all
 #   ./reclaim.sh --host spanner-box:9020 --project my-proj --instance my-inst --all
 #
-# Seeded databases -- protect the seed data and the newest writes:
+# Seeded databases -- protect the seed data and the newest writes. Capture the
+# boundary AFTER seeding has finished and a one-second pause: a whole-second
+# timestamp is truncated downward, so one taken in the same second as the last
+# seed commit lands before it and that second's seed rows count as churn.
+#   sleep 1; SEED_DONE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 #   ./reclaim.sh --all --not-before "$SEED_DONE" --not-after-lag 60s
 #
 # --delete-rows additionally erases LIVE rows whose commit timestamp falls inside
