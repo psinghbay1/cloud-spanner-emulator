@@ -16,6 +16,8 @@
 
 #include "backend/storage/in_memory_storage.h"
 
+#include <cstdint>
+#include <iterator>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -298,6 +300,95 @@ void InMemoryStorage::CleanUpDeletedColumns(absl::Time timestamp) {
     }
     it = dropped_columns_.erase(it);
   }
+}
+
+template <typename Visitor>
+void InMemoryStorage::ForEachTable(const std::vector<TableID>& table_ids,
+                                   Visitor visit) {
+  if (table_ids.empty()) {
+    for (auto& [_, table] : tables_) {
+      visit(table);
+    }
+    return;
+  }
+  for (const TableID& table_id : table_ids) {
+    auto table_itr = tables_.find(table_id);
+    if (table_itr != tables_.end()) {
+      visit(table_itr->second);
+    }
+  }
+}
+
+int64_t InMemoryStorage::PurgeExpiredDeletedRows(
+    absl::Time timestamp, const std::vector<TableID>& table_ids) {
+  absl::MutexLock lock(mu_);
+  absl::Time expiration_time;
+  {
+    absl::MutexLock retention_lock(version_retention_period_mu_);
+    expiration_time = timestamp - version_retention_period_;
+  }
+
+  // Reads below the retention floor are rejected, so a row whose last version
+  // is a deletion before `expiration_time` cannot be observed by anyone.
+  auto is_purgeable = [&](const Row& row) {
+    auto cell_itr = row.find(kExistsColumn);
+    if (cell_itr == row.end() || cell_itr->second.empty()) {
+      return false;
+    }
+    const Cell& cell = cell_itr->second;
+    // A version at or after the floor may still be read.
+    if (cell.upper_bound(expiration_time) != cell.end()) {
+      return false;
+    }
+    const googlesql::Value& newest = cell.rbegin()->second;
+    return newest.is_valid() && !newest.bool_value();
+  };
+
+  int64_t purged = 0;
+  ForEachTable(table_ids, [&](Table& table) {
+    for (auto it = table.begin(); it != table.end();) {
+      if (is_purgeable(it->second)) {
+        it = table.erase(it);
+        ++purged;
+      } else {
+        ++it;
+      }
+    }
+  });
+  return purged;
+}
+
+int64_t InMemoryStorage::PurgeExpiredVersions(
+    absl::Time timestamp, const std::vector<TableID>& table_ids) {
+  absl::MutexLock lock(mu_);
+  absl::Time expiration_time;
+  {
+    absl::MutexLock retention_lock(version_retention_period_mu_);
+    expiration_time = timestamp - version_retention_period_;
+  }
+
+  // Same rule as RemoveExpiredVersions(): keep the newest version at or before
+  // the floor, since it is the value a read inside the window resolves to.
+  int64_t erased = 0;
+  auto purge_cell = [&](Cell& cell) {
+    auto upper_bound = cell.upper_bound(expiration_time);
+    for (auto it = cell.begin(); it != upper_bound;) {
+      if (std::next(it) == upper_bound) {
+        break;
+      }
+      it = cell.erase(it);
+      ++erased;
+    }
+  };
+
+  ForEachTable(table_ids, [&](Table& table) {
+    for (auto& [_, row] : table) {
+      for (auto& [_column_id, cell] : row) {
+        purge_cell(cell);
+      }
+    }
+  });
+  return erased;
 }
 
 void InMemoryStorage::MarkDroppedTable(absl::Time timestamp,

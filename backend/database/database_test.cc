@@ -26,6 +26,9 @@
 #include "googlesql/base/testing/status_matchers.h"
 #include "tests/common/proto_matchers.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "backend/access/read.h"
 #include "backend/datamodel/key_set.h"
 #include "backend/schema/updater/schema_updater.h"
@@ -300,6 +303,121 @@ TEST_F(DatabaseTest, SchemaChangeLocksSuccesfullyReleased) {
       db->CreateReadWriteTransaction(ReadWriteOptions(), RetryState()));
   GOOGLESQL_EXPECT_OK(txn->Read(read_column("T", "k1"), &row_cursor));
   GOOGLESQL_EXPECT_OK(txn->Commit());
+}
+
+// The retention floor sits an hour behind the clock, so the reclaim tests
+// sweep as of a time past it instead of waiting.
+constexpr absl::Duration kPastRetention = absl::Hours(2);
+
+class DatabaseReclaimTest : public DatabaseTest {
+ protected:
+  std::unique_ptr<Database> CreateDatabase() {
+    std::vector<std::string> create_statements = {R"(
+      CREATE TABLE T(
+        k1 INT64,
+        k2 INT64,
+      ) PRIMARY KEY(k1)
+    )"};
+    absl::StatusOr<std::unique_ptr<Database>> database = Database::Create(
+        &clock_, kDatabaseId,
+        SchemaChangeOperation{.statements = create_statements});
+    EXPECT_TRUE(database.ok()) << database.status();
+    return *std::move(database);
+  }
+
+  void Apply(Database* database, const Mutation& mutation) {
+    GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<ReadWriteTransaction> txn,
+        database->CreateReadWriteTransaction(ReadWriteOptions(), RetryState()));
+    GOOGLESQL_ASSERT_OK(txn->Write(mutation));
+    GOOGLESQL_ASSERT_OK(txn->Commit());
+  }
+
+  void InsertThenDeleteRow(Database* database) {
+    Mutation insert;
+    insert.AddWriteOp(MutationOpType::kInsert, "T", {"k1", "k2"},
+                      {{Int64(1), Int64(1)}});
+    Apply(database, insert);
+    Mutation remove;
+    remove.AddDeleteOp("T", KeySet::All());
+    Apply(database, remove);
+  }
+};
+
+TEST_F(DatabaseReclaimTest, ReclaimErasesRowsDeletedBeforeRetentionFloor) {
+  std::unique_ptr<Database> database = CreateDatabase();
+  InsertThenDeleteRow(database.get());
+
+  // Still inside the retention window: a stale read may see the row.
+  EXPECT_EQ(database->ReclaimStorage().rows_purged, 0);
+
+  EXPECT_EQ(database->ReclaimStorage(clock_.Now() + kPastRetention).rows_purged,
+            1);
+  EXPECT_EQ(database->ReclaimStorage(clock_.Now() + kPastRetention).rows_purged,
+            0);
+}
+
+TEST_F(DatabaseReclaimTest, ReclaimTrimsSupersededVersionsOfLiveRow) {
+  std::unique_ptr<Database> database = CreateDatabase();
+  Mutation insert;
+  insert.AddWriteOp(MutationOpType::kInsert, "T", {"k1", "k2"},
+                    {{Int64(1), Int64(1)}});
+  Apply(database.get(), insert);
+  for (int value : {2, 3}) {
+    Mutation update;
+    update.AddWriteOp(MutationOpType::kUpdate, "T", {"k1", "k2"},
+                      {{Int64(1), Int64(value)}});
+    Apply(database.get(), update);
+  }
+
+  EXPECT_EQ(database->ReclaimStorage().versions_purged, 0);
+  Database::ReclaimStats stats =
+      database->ReclaimStorage(clock_.Now() + kPastRetention);
+  EXPECT_GE(stats.versions_purged, 2);
+  EXPECT_EQ(stats.rows_purged, 0);
+
+  // The live row keeps its latest value.
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<ReadOnlyTransaction> txn,
+      database->CreateReadOnlyTransaction(ReadOnlyOptions()));
+  std::unique_ptr<RowCursor> row_cursor;
+  GOOGLESQL_ASSERT_OK(txn->Read(read_column("T", "k2"), &row_cursor));
+  ASSERT_TRUE(row_cursor->Next());
+  EXPECT_EQ(row_cursor->ColumnValue(0), Int64(3));
+  EXPECT_FALSE(row_cursor->Next());
+}
+
+TEST_F(DatabaseReclaimTest, NoBackgroundPurgeWhenIntervalUnset) {
+  ASSERT_EQ(config::storage_purge_interval(), absl::ZeroDuration());
+  std::unique_ptr<Database> database = CreateDatabase();
+  InsertThenDeleteRow(database.get());
+
+  absl::SleepFor(absl::Milliseconds(200));
+  EXPECT_EQ(database->background_purge_count(), 0);
+
+  // The tombstoned row key is still held until something sweeps it.
+  EXPECT_EQ(database->ReclaimStorage(clock_.Now() + kPastRetention).rows_purged,
+            1);
+}
+
+TEST_F(DatabaseReclaimTest, BackgroundPurgeRunsAtInterval) {
+  config::set_storage_purge_interval(absl::Milliseconds(10));
+  std::unique_ptr<Database> database = CreateDatabase();
+  config::set_storage_purge_interval(absl::ZeroDuration());
+  InsertThenDeleteRow(database.get());
+
+  const absl::Time deadline = absl::Now() + absl::Seconds(30);
+  while (database->background_purge_count() < 2 && absl::Now() < deadline) {
+    absl::SleepFor(absl::Milliseconds(5));
+  }
+  EXPECT_GE(database->background_purge_count(), 2);
+
+  // The background sweeps left the row deleted inside the retention window.
+  EXPECT_EQ(database->ReclaimStorage(clock_.Now() + kPastRetention).rows_purged,
+            1);
+
+  // Returns only once the purge thread has stopped.
+  database.reset();
 }
 
 }  // namespace

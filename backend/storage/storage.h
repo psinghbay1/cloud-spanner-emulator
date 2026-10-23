@@ -17,6 +17,9 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_STORAGE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_STORAGE_H_
 
+#include <cstdint>
+#include <vector>
+
 #include "googlesql/public/value.h"
 #include "absl/status/status.h"
 #include "absl/time/time.h"
@@ -87,6 +90,31 @@ class Storage {
 
   virtual void MarkDroppedColumn(absl::Time timestamp, TableID dropped_table_id,
                                  ColumnID dropped_column_id) = 0;
+
+  // Erases rows whose newest version is a deletion marker older than
+  // `timestamp - version_retention_period`, including the row key itself.
+  //
+  // Delete() only appends a tombstone, so a deleted row that is never written
+  // again would otherwise stay in memory for the lifetime of the process. Such
+  // a row is invisible at every timestamp a transaction may still read.
+  //
+  // `table_ids` scopes the sweep; an empty vector sweeps every table. Returns
+  // the number of row keys erased.
+  virtual int64_t PurgeExpiredDeletedRows(
+      absl::Time timestamp, const std::vector<TableID>& table_ids) = 0;
+
+  // Erases superseded versions older than
+  // `timestamp - version_retention_period` from every cell.
+  //
+  // Expired versions are otherwise only trimmed while their own cell is being
+  // written, so a cell that is updated and then left alone keeps them forever.
+  // The newest version at or before the retention floor is kept, so reads
+  // inside the retention window still resolve correctly.
+  //
+  // `table_ids` scopes the sweep; an empty vector sweeps every table. Returns
+  // the number of versions erased.
+  virtual int64_t PurgeExpiredVersions(
+      absl::Time timestamp, const std::vector<TableID>& table_ids) = 0;
 };
 
 }  // namespace backend
