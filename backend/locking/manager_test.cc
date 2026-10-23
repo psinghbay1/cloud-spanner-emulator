@@ -106,6 +106,13 @@ class LockManagerTest : public testing::Test {
         TransactionPriority(1));
   }
 
+  // An abortable handle with an explicit priority (begin time; lower = older).
+  std::unique_ptr<LockHandle> AbortableHandle(int64_t id, int64_t priority) {
+    return manager()->CreateHandle(
+        TransactionID(id), []() { return absl::OkStatus(); },
+        TransactionPriority(priority));
+  }
+
   std::unique_ptr<LockHandle> Handle(int64_t id) {
     return manager()->CreateHandle(TransactionID(id), /*try_abort_fn=*/nullptr,
                                    TransactionPriority(1));
@@ -771,6 +778,174 @@ TEST_F(LockManagerTest, DefaultWoundedHolderKeepsUpstreamMessage) {
                       "getting priority. The emulator only supports one "
                       "transaction at a time.")));
   config::set_abort_current_transaction_probability(saved_probability);
+}
+
+// --lock_conflict_policy=wound_wait, which applies only with key-range locking.
+class WoundWaitLockManagerTest : public KeyRangeLockManagerTest {
+ protected:
+  void SetUp() override {
+    KeyRangeLockManagerTest::SetUp();
+    saved_policy_ = config::lock_conflict_policy();
+    config::set_lock_conflict_policy(config::LockConflictPolicy::kWoundWait);
+  }
+  void TearDown() override {
+    config::set_lock_conflict_policy(saved_policy_);
+    KeyRangeLockManagerTest::TearDown();
+  }
+
+ private:
+  config::LockConflictPolicy saved_policy_ = config::LockConflictPolicy::kRandom;
+};
+
+TEST_F(WoundWaitLockManagerTest, OlderRequesterWoundsYoungerHolder) {
+  std::unique_ptr<LockHandle> older = AbortableHandle(1);
+  std::unique_ptr<LockHandle> younger = AbortableHandle(2);
+  younger->EnqueueLock(Write("table", 0, 10));
+  GOOGLESQL_EXPECT_OK(younger->Wait());
+
+  older->EnqueueLock(Write("table", 0, 10));
+  const std::string diag =
+      Scenario("older requester over younger holder", "write table[0,10)",
+               older.get(), "write table[0,10)", younger.get());
+  GOOGLESQL_EXPECT_OK(older->Wait()) << diag;
+  ASSERT_TRUE(younger->IsAborted()) << diag;
+  EXPECT_THAT(std::string(younger->Wait().message()),
+              testing::HasSubstr("Rule: wound-wait"));
+}
+
+TEST_F(WoundWaitLockManagerTest, YoungerRequesterIsAbortedByOlderHolder) {
+  std::unique_ptr<LockHandle> older = AbortableHandle(1);
+  std::unique_ptr<LockHandle> younger = AbortableHandle(2);
+  older->EnqueueLock(Write("table", 0, 10));
+  GOOGLESQL_EXPECT_OK(older->Wait());
+
+  younger->EnqueueLock(Read("table", 5, 6));
+  ASSERT_TRUE(younger->IsAborted());
+  EXPECT_FALSE(older->IsAborted()) << "an older holder must never be wounded";
+  const std::string message(younger->Wait().message());
+  EXPECT_THAT(message, testing::HasSubstr("conflicting lock on table 'table'"));
+  EXPECT_THAT(message, testing::HasSubstr("younger requester"));
+}
+
+TEST_F(WoundWaitLockManagerTest, PriorityDecidesAgeBeforeTransactionId) {
+  // Priority is the begin time a retry keeps, so a retried transaction with a
+  // newer id is still the older one.
+  std::unique_ptr<LockHandle> holder = AbortableHandle(5, /*priority=*/200);
+  std::unique_ptr<LockHandle> retried = AbortableHandle(9, /*priority=*/100);
+  holder->EnqueueLock(Write("table", 0, 10));
+  retried->EnqueueLock(Write("table", 0, 10));
+  GOOGLESQL_EXPECT_OK(retried->Wait());
+  EXPECT_TRUE(holder->IsAborted());
+}
+
+TEST_F(WoundWaitLockManagerTest, RequesterYoungerThanAnyHolderIsAborted) {
+  // T1 (oldest) and T3 (youngest) share [0,10); T2 is older than T3 only.
+  std::unique_ptr<LockHandle> t1 = AbortableHandle(1);
+  std::unique_ptr<LockHandle> t2 = AbortableHandle(2);
+  std::unique_ptr<LockHandle> t3 = AbortableHandle(3);
+  t1->EnqueueLock(Read("table", 0, 10));
+  t3->EnqueueLock(Read("table", 0, 10));
+
+  t2->EnqueueLock(Write("table", 0, 10));
+  EXPECT_TRUE(t2->IsAborted());
+  EXPECT_FALSE(t1->IsAborted());
+  EXPECT_FALSE(t3->IsAborted()) << "no holder is wounded unless all can be";
+}
+
+TEST_F(WoundWaitLockManagerTest, OlderRequesterLosesIfHolderCannotBeWounded) {
+  std::unique_ptr<LockHandle> older = AbortableHandle(1);
+  std::unique_ptr<LockHandle> younger = Handle(2);  // e.g. mid-commit
+  younger->EnqueueLock(Write("table", 0, 10));
+  older->EnqueueLock(Write("table", 0, 10));
+  ASSERT_TRUE(older->IsAborted());
+  EXPECT_FALSE(younger->IsAborted());
+  EXPECT_THAT(std::string(older->Wait().message()),
+              testing::HasSubstr("could not be wounded"));
+}
+
+TEST_F(WoundWaitLockManagerTest, SchemaChangeRequestNeverWounds) {
+  std::unique_ptr<LockHandle> reader = AbortableHandle(2);
+  std::unique_ptr<LockHandle> ddl = AbortableHandle(1, /*priority=*/0);
+  reader->EnqueueLock(Read("table", 0, 10));
+  ddl->EnqueueLock(LockRequest(LockMode::kExclusive, "", KeyRange::All(), {}));
+  EXPECT_TRUE(ddl->IsAborted());
+  EXPECT_FALSE(reader->IsAborted());
+}
+
+TEST_F(WoundWaitLockManagerTest, OutcomeIsDeterministicAcrossRuns) {
+  for (int run = 0; run < 200; ++run) {
+    LockManager fresh_manager(clock());
+    std::unique_ptr<LockHandle> older = fresh_manager.CreateHandle(
+        TransactionID(1), []() { return absl::OkStatus(); },
+        TransactionPriority(1));
+    std::unique_ptr<LockHandle> younger = fresh_manager.CreateHandle(
+        TransactionID(2), []() { return absl::OkStatus(); },
+        TransactionPriority(1));
+    older->EnqueueLock(Write("table", 0, 10));
+    younger->EnqueueLock(Write("table", 0, 10));
+    ASSERT_FALSE(older->IsAborted()) << "run " << run;
+    ASSERT_TRUE(younger->IsAborted()) << "run " << run;
+  }
+}
+
+class RandomPolicyLockManagerTest : public KeyRangeLockManagerTest {
+ protected:
+  void SetUp() override {
+    KeyRangeLockManagerTest::SetUp();
+    saved_policy_ = config::lock_conflict_policy();
+    saved_probability_ = config::abort_current_transaction_probability();
+    config::set_lock_conflict_policy(config::LockConflictPolicy::kRandom);
+  }
+  void TearDown() override {
+    config::set_lock_conflict_policy(saved_policy_);
+    config::set_abort_current_transaction_probability(saved_probability_);
+    KeyRangeLockManagerTest::TearDown();
+  }
+
+ private:
+  config::LockConflictPolicy saved_policy_ = config::LockConflictPolicy::kRandom;
+  int saved_probability_ = 0;
+};
+
+TEST_F(RandomPolicyLockManagerTest, ZeroProbabilityAbortsEvenAnOlderRequester) {
+  config::set_abort_current_transaction_probability(0);
+  std::unique_ptr<LockHandle> older = AbortableHandle(1);
+  std::unique_ptr<LockHandle> younger = AbortableHandle(2);
+  younger->EnqueueLock(Write("table", 0, 10));
+  older->EnqueueLock(Write("table", 0, 10));
+  ASSERT_TRUE(older->IsAborted()) << "age is ignored under the random policy";
+  EXPECT_FALSE(younger->IsAborted());
+  EXPECT_THAT(std::string(older->Wait().message()),
+              testing::HasSubstr("Rule: random preemption"));
+}
+
+TEST_F(RandomPolicyLockManagerTest, FullProbabilityLetsAYoungerRequesterWound) {
+  config::set_abort_current_transaction_probability(100);
+  std::unique_ptr<LockHandle> older = AbortableHandle(1);
+  std::unique_ptr<LockHandle> younger = AbortableHandle(2);
+  older->EnqueueLock(Write("table", 0, 10));
+  younger->EnqueueLock(Write("table", 0, 10));
+  GOOGLESQL_EXPECT_OK(younger->Wait());
+  ASSERT_TRUE(older->IsAborted());
+  EXPECT_THAT(std::string(older->Wait().message()),
+              testing::HasSubstr("Rule: random preemption"));
+}
+
+TEST_F(LockManagerTest, DefaultPolicyIsRandom) {
+  EXPECT_EQ(config::lock_conflict_policy(), config::LockConflictPolicy::kRandom);
+}
+
+TEST_F(LockManagerTest, WoundWaitIsIgnoredWithoutKeyRangeLocking) {
+  const config::LockConflictPolicy saved_policy = config::lock_conflict_policy();
+  config::set_lock_conflict_policy(config::LockConflictPolicy::kWoundWait);
+  std::unique_ptr<LockHandle> older = Handle(1);
+  std::unique_ptr<LockHandle> younger = Handle(2);
+  younger->EnqueueLock(Write("table", 0, 10));
+  older->EnqueueLock(Write("table", 90, 100));
+  // The database-wide lock still aborts the requester, whatever its age.
+  EXPECT_TRUE(older->IsAborted());
+  EXPECT_FALSE(younger->IsAborted());
+  config::set_lock_conflict_policy(saved_policy);
 }
 
 TEST_F(LockManagerTest, EnsuresSerializationWithParallelTransactions) {

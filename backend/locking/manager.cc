@@ -162,21 +162,26 @@ void LockManager::EnqueueLock(LockHandle* handle, const LockRequest& request) {
     RecordLock(handle, request);
     return;
   }
-  ResolveConflict(handle, request, blockers);
+  if (config::lock_conflict_policy() == config::LockConflictPolicy::kWoundWait) {
+    ResolveConflictByWoundWait(handle, request, blockers);
+  } else {
+    ResolveConflict(handle, request, blockers);
+  }
 }
 
 // Wounds every blocker and grants the request, or returns false if one cannot
 // be wounded (e.g. mid-commit). All of them: wounding one of two shared holders
 // would leave the other co-resident with the granted exclusive lock.
 bool LockManager::WoundAll(LockHandle* handle, const LockRequest& request,
-                           const std::vector<LockHandle*>& blockers) {
+                           const std::vector<LockHandle*>& blockers,
+                           bool wound_wait) {
   for (LockHandle* blocker : blockers) {
-    if (!blocker->TryAbortTransaction(
-                     error::AbortCurrentTransaction(
-                         blocker->tid(), handle->tid(), kRandomPreemptionRule))
-             .ok()) {
-      return false;
-    }
+    const absl::Status wound =
+        wound_wait
+            ? error::WoundedByOlderTransaction(blocker->tid(), handle->tid())
+            : error::AbortCurrentTransaction(blocker->tid(), handle->tid(),
+                                             kRandomPreemptionRule);
+    if (!blocker->TryAbortTransaction(wound).ok()) return false;
     ReleaseLocksFor(blocker->tid());
   }
   RecordLock(handle, request);
@@ -192,12 +197,43 @@ void LockManager::ResolveConflict(
   absl::BitGen gen;
   if (absl::uniform_int_distribution<int>(1, 100)(gen) <=
           config::abort_current_transaction_probability() &&
-      WoundAll(handle, request, blockers)) {
+      WoundAll(handle, request, blockers, /*wound_wait=*/false)) {
     return;
   }
   handle->Abort(error::AbortConflictingKeyRange(
       handle->tid(), blockers.front()->tid(), request.table_id(),
       request.key_range().DebugString(), kRandomPreemptionRule));
+}
+
+// Cloud Spanner's rule: an older requester wounds every younger holder; a
+// younger requester is aborted, not left waiting, because EnqueueLock runs
+// under the caller's transaction mutex and a waiter could not itself be
+// wounded. A retry keeps its original priority, so it ages into the winner.
+// A schema change (database-wide request) never wounds.
+void LockManager::ResolveConflictByWoundWait(
+    LockHandle* handle, const LockRequest& request,
+    const std::vector<LockHandle*>& blockers) {
+  LockHandle* oldest_blocker = blockers.front();
+  for (LockHandle* blocker : blockers) {
+    if (IsOlder(blocker, oldest_blocker)) oldest_blocker = blocker;
+  }
+  const std::string range = request.key_range().DebugString();
+  if (request.table_id().empty() || !IsOlder(handle, oldest_blocker)) {
+    handle->Abort(error::AbortYoungerRequester(
+        handle->tid(), oldest_blocker->tid(), request.table_id(), range));
+    return;
+  }
+  if (WoundAll(handle, request, blockers, /*wound_wait=*/true)) return;
+  handle->Abort(error::AbortConflictingKeyRange(
+      handle->tid(), oldest_blocker->tid(), request.table_id(), range,
+      "wound-wait (a younger holder could not be wounded, e.g. mid-commit)"));
+}
+
+bool LockManager::IsOlder(LockHandle* lhs, LockHandle* rhs) {
+  if (lhs->priority() != rhs->priority()) {
+    return lhs->priority() < rhs->priority();
+  }
+  return lhs->tid() < rhs->tid();
 }
 
 // The pre-existing whole-database lock. Caller must hold mu_.

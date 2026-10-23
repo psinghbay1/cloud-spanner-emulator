@@ -171,6 +171,17 @@ absl::StatusOr<std::vector<WriteOp>> FlattenNonDeleteOpRow(
   return std::move(write_ops);
 }
 
+// The whole-database lock keeps upstream's message (empty rule); under
+// key-range locking only a holder of an overlapping range can preempt this
+// transaction, by the configured conflict policy.
+absl::string_view WoundRule() {
+  if (!config::enable_key_range_locking()) return "";
+  return config::lock_conflict_policy() ==
+                 config::LockConflictPolicy::kWoundWait
+             ? "wound-wait"
+             : "random preemption";
+}
+
 bool ShouldAbortOnFirstCommit() {
   absl::BitGen gen;
   return config::fault_injection_enabled() &&
@@ -356,10 +367,7 @@ absl::Status ReadWriteTransaction::GuardedCall(
           "Invalid call to Committed transaction. Transaction: ", id()));
     case State::kAborted: {
       if (op != OpType::kRollback) {
-        // The whole-database lock keeps upstream's message; under key-range
-        // locking only an overlapping range can preempt this transaction.
-        return error::WoundedTransaction(
-            id_, config::enable_key_range_locking() ? "random preemption" : "");
+        return error::WoundedTransaction(id_, WoundRule());
       }
       break;
     }

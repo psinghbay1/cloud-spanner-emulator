@@ -60,6 +60,19 @@ void set_abort_current_transaction_probability(int probability);
 bool enable_key_range_locking();
 void set_enable_key_range_locking(bool enabled);
 
+// How the lock manager resolves a key-range conflict. Ignored when key-range
+// locking is off, where the database-wide lock always uses kRandom.
+enum class LockConflictPolicy {
+  // Abort the holder with abort_current_transaction_probability, else the
+  // requester. The default.
+  kRandom,
+  // By age: an older requester wounds a younger holder; a younger requester is
+  // aborted.
+  kWoundWait,
+};
+LockConflictPolicy lock_conflict_policy();
+void set_lock_conflict_policy(LockConflictPolicy policy);
+
 // With key-range locking, how long, in milliseconds, a committing transaction
 // waits for a peer's commit-timestamp reservation to clear before it is
 // aborted. 0 means abort at once. Ignored when key-range locking is off.

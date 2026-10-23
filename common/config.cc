@@ -60,6 +60,16 @@ ABSL_FLAG(
     "one read-write transaction runs at a time.");
 
 ABSL_FLAG(
+    std::string, lock_conflict_policy, "random",
+    "With --enable_key_range_locking, how a lock conflict is resolved. "
+    "'random' (the default) aborts the holder with "
+    "--abort_current_transaction_probability, else the requester. "
+    "'wound_wait' decides by transaction age, as Cloud Spanner does: an older "
+    "requester aborts (wounds) a younger holder, and a younger requester is "
+    "aborted. Any other value is treated as 'random'. Ignored when key-range "
+    "locking is disabled.");
+
+ABSL_FLAG(
     int, commit_reservation_wait_ms, 5000,
     "With --enable_key_range_locking, how long in milliseconds a committing "
     "transaction waits for another transaction to finish reserving its commit "
@@ -97,6 +107,19 @@ bool enable_key_range_locking() {
 
 void set_enable_key_range_locking(bool enabled) {
   absl::SetFlag(&FLAGS_enable_key_range_locking, enabled);
+}
+
+LockConflictPolicy lock_conflict_policy() {
+  if (absl::GetFlag(FLAGS_lock_conflict_policy) == "wound_wait") {
+    return LockConflictPolicy::kWoundWait;
+  }
+  return LockConflictPolicy::kRandom;
+}
+
+void set_lock_conflict_policy(LockConflictPolicy policy) {
+  absl::SetFlag(&FLAGS_lock_conflict_policy,
+                policy == LockConflictPolicy::kWoundWait ? "wound_wait"
+                                                         : "random");
 }
 
 int commit_reservation_wait_ms() {
