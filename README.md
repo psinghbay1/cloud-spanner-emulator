@@ -117,6 +117,55 @@ The first port is the gRPC port and the second port is the REST port.
 
 Works on x86 and arm64 architectures.
 
+## Optional features
+
+These features are off by default, so the emulator behaves as described
+elsewhere in this document unless you turn them on.
+
+### Schema version retention
+
+**Problem.** Every DDL batch applied to a database creates a new, complete copy
+of the schema, and the emulator keeps each superseded copy for the database's
+`version_retention_period` (one hour by default) so that stale and snapshot
+reads can still resolve the schema in effect at their timestamp. A test suite
+that loads a large schema in many DDL batches, or recreates databases often,
+therefore holds dozens of full schema graphs per database for an hour, and the
+emulator's memory grows with every schema load.
+
+**What the flag does.** `--schema_version_retention=<duration>` bounds how long
+a superseded schema version is kept once a newer DDL batch has been applied.
+Versions older than that are dropped as each batch lands. The latest version is
+always kept, as is the version in effect at the cutoff. `0s` keeps only the
+latest version. A transaction that has already resolved a schema version keeps
+it alive until it finishes, so in-flight reads are not affected.
+
+**How to enable.** Pass the flag to `gateway_main`, which forwards it to
+`emulator_main`, or to `emulator_main` directly:
+
+```shell
+./gateway_main --schema_version_retention=0s
+./emulator_main --schema_version_retention=10m
+```
+
+With the docker image, set the `SCHEMA_VERSION_RETENTION` environment variable,
+which overrides the flag, or pass the flag on the command line:
+
+```shell
+docker run -p 9010:9010 -p 9020:9020 -e SCHEMA_VERSION_RETENTION=0s \
+    gcr.io/cloud-spanner-emulator/emulator
+docker run -p 9010:9010 -p 9020:9020 gcr.io/cloud-spanner-emulator/emulator \
+    ./gateway_main --hostname 0.0.0.0 --schema_version_retention=0s
+```
+
+**Caveats.** A stale or snapshot read (read, query, partitioned read or change
+stream) at a timestamp older than the oldest kept schema version fails with
+`FAILED_PRECONDITION`, the same error as a read past the version retention
+period, instead of being served with a newer schema. Only enable it when your
+tests do not read at timestamps before their last schema change.
+
+**Default.** Unset, which keeps every schema version for the database's
+`version_retention_period`, exactly as without the flag.
+
 ## Technical Details
 
 The Cloud Spanner Emulator is built using the [GoogleSQL](https://github.com/google/googlesql)

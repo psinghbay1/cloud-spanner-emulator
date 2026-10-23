@@ -16,6 +16,7 @@
 
 #include "backend/schema/catalog/versioned_catalog.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -77,6 +78,14 @@ const Schema* VersionedCatalog::GetSchema(absl::Time timestamp) const {
   return itr->second.get();
 }
 
+std::shared_ptr<const Schema> VersionedCatalog::GetSchemaShared(
+    absl::Time timestamp) const {
+  absl::MutexLock lock(mu_);
+  auto itr = schemas_.upper_bound(timestamp);
+  itr--;
+  return itr->second;
+}
+
 const Schema* VersionedCatalog::GetLatestSchema() const {
   return GetSchema(absl::InfiniteFuture());
 }
@@ -95,22 +104,61 @@ absl::Status VersionedCatalog::AddSchema(absl::Time creation_time,
   }
   version_retention_period_ = *version_retention_period;
   schemas_[creation_time] = std::move(schema);
+  // Pruned here because a schema load applies many DDL batches and nothing
+  // after the last one runs RemoveExpiredSchemas, so every intermediate
+  // version would otherwise live for the whole retention period.
+  if (schema_version_retention_.has_value()) {
+    PruneSchemasOlderThanLocked(creation_time - *schema_version_retention_);
+  }
   return absl::OkStatus();
 }
 
 void VersionedCatalog::RemoveExpiredSchemas(absl::Time timestamp) {
   absl::MutexLock lock(mu_);
-  auto upper_bound =
-      schemas_.upper_bound(timestamp - version_retention_period_);
+  PruneSchemasOlderThanLocked(timestamp - version_retention_period_);
+}
+
+int64_t VersionedCatalog::PruneSchemasOlderThan(absl::Time cutoff) {
+  absl::MutexLock lock(mu_);
+  return PruneSchemasOlderThanLocked(cutoff);
+}
+
+int64_t VersionedCatalog::PruneSchemasOlderThanLocked(absl::Time cutoff) {
+  auto upper_bound = schemas_.upper_bound(cutoff);
   auto it = ++schemas_.begin();  // Skip the infinite past schema.
+  int64_t erased = 0;
   while (it != upper_bound) {
     auto next = it;
     if (++next == upper_bound) {
-      // The current schema needs to be kept to cover the retention period.
+      // The current schema needs to be kept: it is the one in effect at
+      // `cutoff`, so reads at and after `cutoff` still resolve to it.
       break;
     }
     it = schemas_.erase(it);
+    ++erased;
   }
+  if (erased > 0) {
+    // `it` is the kept covering version (or the latest). Anything older is
+    // gone, so reads below its creation time must be refused, not served
+    // with a newer schema.
+    min_readable_time_ = std::max(min_readable_time_, it->first);
+  }
+  return erased;
+}
+
+absl::Time VersionedCatalog::LatestSchemaTime() const {
+  absl::MutexLock lock(mu_);
+  return schemas_.rbegin()->first;
+}
+
+absl::Time VersionedCatalog::MinReadableSchemaTime() const {
+  absl::MutexLock lock(mu_);
+  return min_readable_time_;
+}
+
+void VersionedCatalog::set_schema_version_retention(absl::Duration retention) {
+  absl::MutexLock lock(mu_);
+  schema_version_retention_ = retention;
 }
 
 }  // namespace backend

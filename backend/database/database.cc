@@ -47,6 +47,7 @@
 #include "backend/transaction/read_only_transaction.h"
 #include "backend/transaction/read_write_transaction.h"
 #include "common/clock.h"
+#include "common/config.h"
 #include "common/errors.h"
 #include "googlesql/base/status_macros.h"
 #include "absl/status/status.h"
@@ -122,13 +123,25 @@ absl::StatusOr<std::unique_ptr<Database>> Database::Create(
   database->storage_->SetVersionRetentionPeriod(
       database->versioned_catalog_->version_retention_period());
 
+  if (config::schema_version_retention_set()) {
+    database->versioned_catalog_->set_schema_version_retention(
+        config::schema_version_retention());
+  }
+
   return database;
 }
 absl::StatusOr<std::unique_ptr<ReadOnlyTransaction>>
 Database::CreateReadOnlyTransaction(const ReadOnlyOptions& options) {
-  return std::make_unique<ReadOnlyTransaction>(
+  auto txn = std::make_unique<ReadOnlyTransaction>(
       options, transaction_id_generator_.NextId(), clock_, storage_.get(),
       lock_manager_.get(), versioned_catalog_.get());
+  // The schema in effect at this timestamp was pruned by schema-version
+  // retention. Refusing here covers reads, queries, partitions and change
+  // streams; serving a newer schema instead would be silently wrong.
+  if (txn->read_timestamp() < versioned_catalog_->MinReadableSchemaTime()) {
+    return error::ReadTimestampPastVersionGCLimit(txn->read_timestamp());
+  }
+  return txn;
 }
 
 absl::StatusOr<std::unique_ptr<ReadWriteTransaction>>

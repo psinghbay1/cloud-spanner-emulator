@@ -21,6 +21,7 @@
 
 #include "absl/base/thread_annotations.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "backend/access/read.h"
@@ -58,7 +59,8 @@ class ReadOnlyTransaction : public RowReader {
 
   absl::Time read_timestamp() const { return read_timestamp_; }
 
-  // Returns the schema used by this transaction.
+  // Returns the schema used by this transaction. The first call pins the
+  // version, so a later schema-version prune cannot free it mid-use.
   const Schema* schema() const;
 
   // Returns the ID of this transaction.
@@ -73,6 +75,9 @@ class ReadOnlyTransaction : public RowReader {
 
   // Picks a read timestamp given transaction type and timestamp bound.
   absl::Time PickReadTimestamp();
+
+  // Pins the schema at read_timestamp_, or refuses if it was already pruned.
+  absl::StatusOr<const Schema*> PinSchema() const ABSL_LOCKS_EXCLUDED(pin_mu_);
 
   // Options with which the transaction was created.
   ReadOnlyOptions options_;
@@ -98,6 +103,11 @@ class ReadOnlyTransaction : public RowReader {
 
   // The version retention period for the database.
   const absl::Duration version_retention_period_;
+
+  // Schema version pinned by the first schema() call.
+  mutable absl::Mutex pin_mu_;
+  mutable std::shared_ptr<const Schema> pinned_schema_
+      ABSL_GUARDED_BY(pin_mu_);
 };
 
 }  // namespace backend

@@ -362,6 +362,7 @@ absl::Status ReadWriteTransaction::GuardedCall(
     }
     case State::kUninitialized: {
       schema_ = versioned_catalog_->GetLatestSchema();
+      schema_time_ = versioned_catalog_->LatestSchemaTime();
       auto maybe_action_registry =
           action_manager_->GetActionsForSchema(schema_);
       if (!maybe_action_registry.ok()) {
@@ -374,7 +375,9 @@ absl::Status ReadWriteTransaction::GuardedCall(
       break;
     }
     case State::kActive: {
-      if (schema_ != versioned_catalog_->GetLatestSchema()) {
+      // By creation time, not pointer: a pruned schema's address can be
+      // reused by the version that replaced it.
+      if (schema_time_ != versioned_catalog_->LatestSchemaTime()) {
         Reset();
         ++retry_state_.abort_retry_count;
         return error::AbortDueToConcurrentSchemaChange(id_);

@@ -26,7 +26,9 @@
 #include "absl/status/status.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "backend/access/read.h"
 #include "backend/common/ids.h"
+#include "backend/datamodel/key_set.h"
 #include "backend/schema/catalog/schema.h"
 #include "backend/schema/catalog/versioned_catalog.h"
 #include "backend/storage/in_memory_storage.h"
@@ -131,6 +133,83 @@ TEST_F(ReadOnlyTransactionTest, GetSchema) {
                            &catalog);
   ASSERT_NE(txn2.schema(), nullptr);
   EXPECT_EQ(txn2.schema()->FindTable("test_table"), nullptr);
+}
+
+// Once a schema version has been pruned, a read at a timestamp it
+// covered is refused rather than served with a newer schema.
+TEST_F(ReadOnlyTransactionTest, ReadBelowPrunedSchemaVersionIsRefused) {
+  VersionedCatalog catalog;
+  googlesql::TypeFactory type_factory{};
+  const absl::Time t1 = t0_ + absl::Minutes(1);
+  GOOGLESQL_EXPECT_OK(
+      catalog.AddSchema(t0_, test::CreateSchemaWithOneTable(&type_factory)));
+  GOOGLESQL_EXPECT_OK(
+      catalog.AddSchema(t1, test::CreateSchemaWithOneTable(&type_factory)));
+
+  ReadOnlyOptions opts;
+  opts.bound = TimestampBound::kExactTimestamp;
+  opts.timestamp = t0_ + absl::Seconds(30);  // covered by the t0_ version
+
+  ReadArg read_arg;
+  read_arg.table = "test_table";
+  read_arg.key_set = KeySet::All();
+  read_arg.columns = {"int64_col"};
+
+  // Served before the prune.
+  {
+    ReadOnlyTransaction txn(opts, txn_id_, &clock_, &storage_, &lock_manager_,
+                            &catalog);
+    std::unique_ptr<RowCursor> cursor;
+    GOOGLESQL_EXPECT_OK(txn.Read(read_arg, &cursor));
+  }
+
+  EXPECT_EQ(catalog.PruneSchemasOlderThan(absl::InfiniteFuture()), 1);
+  EXPECT_EQ(catalog.MinReadableSchemaTime(), t1);
+
+  // Refused after it, with the retention error; a read at t1 still works.
+  {
+    ReadOnlyTransaction txn(opts, txn_id_, &clock_, &storage_, &lock_manager_,
+                            &catalog);
+    std::unique_ptr<RowCursor> cursor;
+    EXPECT_THAT(txn.Read(read_arg, &cursor),
+                googlesql_base::testing::StatusIs(
+                    absl::StatusCode::kFailedPrecondition));
+  }
+  {
+    ReadOnlyOptions at_t1;
+    at_t1.bound = TimestampBound::kExactTimestamp;
+    at_t1.timestamp = t1;
+    ReadOnlyTransaction txn(at_t1, txn_id_, &clock_, &storage_, &lock_manager_,
+                            &catalog);
+    std::unique_ptr<RowCursor> cursor;
+    GOOGLESQL_EXPECT_OK(txn.Read(read_arg, &cursor));
+  }
+}
+
+// schema() pins the version it resolved, so pruning it from the
+// catalog does not free it while the transaction is using it.
+TEST_F(ReadOnlyTransactionTest, PinnedSchemaSurvivesPrune) {
+  VersionedCatalog catalog;
+  googlesql::TypeFactory type_factory{};
+  const absl::Time t1 = t0_ + absl::Minutes(1);
+  GOOGLESQL_EXPECT_OK(
+      catalog.AddSchema(t0_, test::CreateSchemaWithOneTable(&type_factory)));
+  GOOGLESQL_EXPECT_OK(
+      catalog.AddSchema(t1, test::CreateSchemaWithOneTable(&type_factory)));
+
+  ReadOnlyOptions opts;
+  opts.bound = TimestampBound::kExactTimestamp;
+  opts.timestamp = t0_ + absl::Seconds(30);
+  ReadOnlyTransaction txn(opts, txn_id_, &clock_, &storage_, &lock_manager_,
+                          &catalog);
+  const Schema* pinned = txn.schema();
+  ASSERT_NE(pinned, nullptr);
+
+  EXPECT_EQ(catalog.PruneSchemasOlderThan(absl::InfiniteFuture()), 1);
+  EXPECT_NE(catalog.GetSchema(opts.timestamp), pinned);  // catalog moved on
+
+  EXPECT_EQ(txn.schema(), pinned);
+  EXPECT_NE(pinned->FindTable("test_table"), nullptr);
 }
 
 TEST_F(ReadOnlyTransactionTest, WaitsForFutureReadTime) {
