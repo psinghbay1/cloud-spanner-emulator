@@ -32,15 +32,23 @@
 #include "googlesql/public/analyzer_options.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/cord.h"
+#include "absl/strings/match.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
+#include "absl/strings/strip.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/optional.h"
 #include "absl/types/variant.h"
 #include "backend/access/read.h"
+#include "backend/database/database.h"
 #include "backend/query/change_stream/change_stream_query_validator.h"
 #include "backend/query/query_engine.h"
 #include "backend/query/queue/queryable_queue_tvfs.h"
+#include "backend/storage/storage.h"
+#include "common/config.h"
 #include "common/constants.h"
 #include "common/errors.h"
 #include "frontend/common/protos.h"
@@ -50,6 +58,7 @@
 #include "frontend/converters/reads.h"
 #include "frontend/converters/types.h"
 #include "frontend/converters/values.h"
+#include "frontend/entities/database.h"
 #include "frontend/entities/session.h"
 #include "frontend/entities/transaction.h"
 #include "frontend/handlers/change_streams.h"
@@ -308,6 +317,245 @@ absl::Status ExecuteQueueReceivePolling(
   return absl::OkStatus();
 }
 
+// Emulator-only diagnostic statements, answered when
+// --enable_emulator_diagnostic_statements is set:
+//
+//   SELECT EMULATOR_RECLAIM(['Table', ...] [, name => value, ...])
+//   SELECT EMULATOR_LOCK_STATS()
+//
+// Each is recognised only as a whole statement, so it cannot match a real
+// query. With the flag off they reach the query engine and fail there as
+// unknown functions, as they do on Cloud Spanner.
+constexpr absl::string_view kReclaimPrefix = "SELECT EMULATOR_RECLAIM(";
+constexpr absl::string_view kLockStatsStatement = "SELECT EMULATOR_LOCK_STATS()";
+
+// Returns the statement without surrounding whitespace or a trailing ';'.
+absl::string_view TrimStatement(absl::string_view sql) {
+  absl::string_view statement = absl::StripAsciiWhitespace(sql);
+  absl::ConsumeSuffix(&statement, ";");
+  return absl::StripAsciiWhitespace(statement);
+}
+
+bool IsEmulatorReclaimStatement(absl::string_view sql) {
+  absl::string_view statement = TrimStatement(sql);
+  return absl::StartsWithIgnoreCase(statement, kReclaimPrefix) &&
+         absl::EndsWith(statement, ")");
+}
+
+bool IsEmulatorLockStatsStatement(absl::string_view sql) {
+  return absl::EqualsIgnoreCase(TrimStatement(sql), kLockStatsStatement);
+}
+
+// Removes one pair of surrounding single quotes, if present.
+absl::string_view Unquote(absl::string_view value) {
+  if (value.size() >= 2 && value.front() == '\'' && value.back() == '\'') {
+    return value.substr(1, value.size() - 2);
+  }
+  return value;
+}
+
+// Splits the text between the parentheses at commas outside single quotes.
+std::vector<absl::string_view> SplitReclaimArguments(absl::string_view sql) {
+  absl::string_view arguments = TrimStatement(sql);
+  arguments.remove_prefix(kReclaimPrefix.size());
+  arguments.remove_suffix(1);
+
+  std::vector<absl::string_view> split;
+  bool in_quotes = false;
+  size_t start = 0;
+  for (size_t i = 0; i < arguments.size(); ++i) {
+    if (arguments[i] == '\'') {
+      in_quotes = !in_quotes;
+    } else if (arguments[i] == ',' && !in_quotes) {
+      split.push_back(
+          absl::StripAsciiWhitespace(arguments.substr(start, i - start)));
+      start = i + 1;
+    }
+  }
+  absl::string_view last = absl::StripAsciiWhitespace(arguments.substr(start));
+  if (!last.empty() || !split.empty()) {
+    split.push_back(last);
+  }
+  return split;
+}
+
+struct ReclaimArguments {
+  std::vector<std::string> table_names;
+  backend::PurgeWindow window;
+  bool delete_rows = false;
+};
+
+absl::Status ReclaimArgumentError(absl::string_view message) {
+  return absl::InvalidArgumentError(
+      absl::StrCat("EMULATOR_RECLAIM: ", message));
+}
+
+absl::StatusOr<absl::Time> ParseReclaimTimestamp(absl::string_view name,
+                                                 absl::string_view value) {
+  absl::Time parsed;
+  std::string parse_error;
+  if (!absl::ParseTime(absl::RFC3339_full, value, &parsed, &parse_error)) {
+    return ReclaimArgumentError(absl::StrCat("could not parse ", name, " \"",
+                                             value, "\": ", parse_error));
+  }
+  return parsed;
+}
+
+// Parses the argument list. An argument that is not understood is rejected:
+// a silently dropped bound would widen a sweep that can delete rows.
+absl::StatusOr<ReclaimArguments> ParseReclaimArguments(absl::string_view sql,
+                                                       absl::Time now) {
+  ReclaimArguments parsed;
+  bool has_not_after = false;
+  for (absl::string_view argument : SplitReclaimArguments(sql)) {
+    size_t arrow = argument.find("=>");
+    if (arrow == absl::string_view::npos) {
+      absl::string_view table_name = Unquote(argument);
+      if (table_name.empty() || table_name.size() == argument.size()) {
+        return ReclaimArgumentError(absl::StrCat(
+            "expected a quoted table name or name => value, got \"", argument,
+            "\""));
+      }
+      parsed.table_names.emplace_back(table_name);
+      continue;
+    }
+    const std::string name = absl::AsciiStrToLower(
+        absl::StripAsciiWhitespace(argument.substr(0, arrow)));
+    const absl::string_view value =
+        Unquote(absl::StripAsciiWhitespace(argument.substr(arrow + 2)));
+    if (name == "not_before") {
+      GOOGLESQL_ASSIGN_OR_RETURN(parsed.window.not_before,
+                       ParseReclaimTimestamp(name, value));
+    } else if (name == "not_after" || name == "not_after_lag") {
+      if (has_not_after) {
+        return ReclaimArgumentError(
+            "pass at most one of not_after and not_after_lag");
+      }
+      has_not_after = true;
+      if (name == "not_after") {
+        GOOGLESQL_ASSIGN_OR_RETURN(parsed.window.not_after,
+                         ParseReclaimTimestamp(name, value));
+      } else {
+        absl::Duration lag;
+        if (!absl::ParseDuration(value, &lag) || lag < absl::ZeroDuration()) {
+          return ReclaimArgumentError(absl::StrCat(
+              "could not parse not_after_lag \"", value, "\""));
+        }
+        parsed.window.not_after = now - lag;
+      }
+    } else if (name == "delete_rows") {
+      if (absl::EqualsIgnoreCase(value, "true")) {
+        parsed.delete_rows = true;
+      } else if (!absl::EqualsIgnoreCase(value, "false")) {
+        return ReclaimArgumentError(absl::StrCat(
+            "delete_rows must be true or false, got \"", value, "\""));
+      }
+    } else {
+      return ReclaimArgumentError(
+          absl::StrCat("unknown argument \"", name, "\""));
+    }
+  }
+  if (parsed.window.not_before.has_value() &&
+      parsed.window.not_after.has_value() &&
+      *parsed.window.not_before >= *parsed.window.not_after) {
+    return ReclaimArgumentError("not_before must be earlier than not_after");
+  }
+  // Unbounded, delete_rows would erase every live row in scope.
+  if (parsed.delete_rows && !parsed.window.not_before.has_value() &&
+      !parsed.window.not_after.has_value()) {
+    return ReclaimArgumentError(
+        "delete_rows requires not_before, not_after or not_after_lag");
+  }
+  return parsed;
+}
+
+void AddColumn(absl::string_view name, google::spanner::v1::TypeCode code,
+               spanner_api::ResultSet* response) {
+  auto* field = response->mutable_metadata()->mutable_row_type()->add_fields();
+  field->set_name(std::string(name));
+  field->mutable_type()->set_code(code);
+}
+
+absl::Status HandleEmulatorReclaim(const Session& session,
+                                   absl::string_view sql,
+                                   spanner_api::ResultSet* response) {
+  GOOGLESQL_ASSIGN_OR_RETURN(ReclaimArguments arguments,
+                   ParseReclaimArguments(sql, absl::Now()));
+  const backend::Database::ReclaimStats stats =
+      session.database()->backend()->ReclaimStorage(
+          arguments.table_names, arguments.window, arguments.delete_rows);
+
+  using google::spanner::v1::TypeCode;
+  AddColumn("rows_purged", TypeCode::INT64, response);
+  AddColumn("versions_purged", TypeCode::INT64, response);
+  AddColumn("rows_deleted", TypeCode::INT64, response);
+  auto* row = response->add_rows();
+  // INT64 values travel as decimal strings on the wire.
+  row->add_values()->set_string_value(absl::StrCat(stats.rows_purged));
+  row->add_values()->set_string_value(absl::StrCat(stats.versions_purged));
+  row->add_values()->set_string_value(absl::StrCat(stats.rows_deleted));
+  return absl::OkStatus();
+}
+
+absl::Status HandleEmulatorLockStats(const Session& session,
+                                     spanner_api::ResultSet* response) {
+  using google::spanner::v1::TypeCode;
+  AddColumn("table_name", TypeCode::STRING, response);
+  AddColumn("whole_table_conflicts", TypeCode::INT64, response);
+  AddColumn("bounded_conflicts", TypeCode::INT64, response);
+  AddColumn("shared_conflicts", TypeCode::INT64, response);
+  AddColumn("exclusive_conflicts", TypeCode::INT64, response);
+  AddColumn("last_conflict_time", TypeCode::TIMESTAMP, response);
+  for (const auto& [table_name, stats] :
+       session.database()->backend()->LockConflictStatsByTable()) {
+    auto* row = response->add_rows();
+    row->add_values()->set_string_value(table_name);
+    row->add_values()->set_string_value(
+        absl::StrCat(stats.whole_table_conflicts));
+    row->add_values()->set_string_value(absl::StrCat(stats.bounded_conflicts));
+    row->add_values()->set_string_value(absl::StrCat(stats.shared_conflicts));
+    row->add_values()->set_string_value(
+        absl::StrCat(stats.exclusive_conflicts));
+    row->add_values()->set_string_value(
+        absl::FormatTime("%Y-%m-%dT%H:%M:%E*SZ", stats.last_conflict_time,
+                         absl::UTCTimeZone()));
+  }
+  return absl::OkStatus();
+}
+
+// Answers an emulator diagnostic statement into `response`. Returns false when
+// the flag is off or `sql` is not one, so the caller runs it as a query. These
+// statements take no transaction, so this runs before transaction setup.
+absl::StatusOr<bool> MaybeHandleEmulatorDiagnosticStatement(
+    const Session& session, absl::string_view sql,
+    spanner_api::ResultSet* response) {
+  if (!config::enable_emulator_diagnostic_statements()) {
+    return false;
+  }
+  if (IsEmulatorReclaimStatement(sql)) {
+    GOOGLESQL_RETURN_IF_ERROR(HandleEmulatorReclaim(session, sql, response));
+    return true;
+  }
+  if (IsEmulatorLockStatsStatement(sql)) {
+    GOOGLESQL_RETURN_IF_ERROR(HandleEmulatorLockStats(session, response));
+    return true;
+  }
+  return false;
+}
+
+// Returns the whole result set as a single streaming chunk.
+spanner_api::PartialResultSet ToPartialResultSet(
+    const spanner_api::ResultSet& result_set) {
+  spanner_api::PartialResultSet partial;
+  *partial.mutable_metadata() = result_set.metadata();
+  for (const auto& row : result_set.rows()) {
+    for (const auto& value : row.values()) {
+      *partial.add_values() = value;
+    }
+  }
+  return partial;
+}
+
 }  //  namespace
 
 // Executes a SQL statement, returning all results in a single reply.
@@ -318,6 +566,13 @@ absl::Status ExecuteSql(RequestContext* ctx,
   // valid throughout this function.
   GOOGLESQL_ASSIGN_OR_RETURN(std::shared_ptr<Session> session,
                    GetSession(ctx, request->session()));
+
+  GOOGLESQL_ASSIGN_OR_RETURN(bool handled,
+                   MaybeHandleEmulatorDiagnosticStatement(
+                       *session, request->sql(), response));
+  if (handled) {
+    return absl::OkStatus();
+  }
 
   // Get underlying transaction.
   bool is_dml_query = backend::IsDMLQuery(request->sql());
@@ -486,6 +741,15 @@ absl::Status ExecuteStreamingSql(
   // valid throughout this function.
   GOOGLESQL_ASSIGN_OR_RETURN(std::shared_ptr<Session> session,
                    GetSession(ctx, request->session()));
+
+  spanner_api::ResultSet diagnostic_result;
+  GOOGLESQL_ASSIGN_OR_RETURN(bool handled,
+                   MaybeHandleEmulatorDiagnosticStatement(
+                       *session, request->sql(), &diagnostic_result));
+  if (handled) {
+    stream->Send(ToPartialResultSet(diagnostic_result));
+    return absl::OkStatus();
+  }
 
   backend::ChangeStreamQueryValidator::ChangeStreamMetadata
       change_stream_metadata;

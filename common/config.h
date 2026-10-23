@@ -75,6 +75,12 @@ absl::Duration storage_purge_interval();
 
 void set_storage_purge_interval(absl::Duration interval);
 
+// True when ExecuteSql and ExecuteStreamingSql answer the emulator-only
+// statements SELECT EMULATOR_RECLAIM(...) and SELECT EMULATOR_LOCK_STATS().
+// Off by default, so they fail as unknown functions, as on Cloud Spanner.
+bool enable_emulator_diagnostic_statements();
+void set_enable_emulator_diagnostic_statements(bool enabled);
+
 }  // namespace config
 }  // namespace emulator
 }  // namespace spanner

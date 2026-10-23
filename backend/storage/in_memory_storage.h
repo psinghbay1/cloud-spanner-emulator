@@ -82,11 +82,21 @@ class InMemoryStorage : public Storage {
       ABSL_LOCKS_EXCLUDED(mu_);
 
   int64_t PurgeExpiredDeletedRows(absl::Time timestamp,
-                                  const std::vector<TableID>& table_ids)
-      override ABSL_LOCKS_EXCLUDED(mu_);
+                                  const std::vector<TableID>& table_ids,
+                                  const PurgeWindow& window) override
+      ABSL_LOCKS_EXCLUDED(mu_);
 
   int64_t PurgeExpiredVersions(absl::Time timestamp,
-                               const std::vector<TableID>& table_ids) override
+                               const std::vector<TableID>& table_ids,
+                               const PurgeWindow& window) override
+      ABSL_LOCKS_EXCLUDED(mu_);
+
+  int64_t DeleteRowsInWindow(const std::vector<TableID>& table_ids,
+                             const PurgeWindow& window) override
+      ABSL_LOCKS_EXCLUDED(mu_);
+
+  int64_t CountRowsInWindow(const std::vector<TableID>& table_ids,
+                            const PurgeWindow& window) override
       ABSL_LOCKS_EXCLUDED(mu_);
 
  private:
@@ -94,6 +104,10 @@ class InMemoryStorage : public Storage {
   using Row = absl::flat_hash_map<ColumnID, Cell>;
   using Table = std::map<Key, Row>;
   using Tables = absl::flat_hash_map<TableID, Table>;
+
+  // True when the row's first commit falls strictly inside `window`. Shared by
+  // DeleteRowsInWindow() and CountRowsInWindow() so they cannot disagree.
+  static bool RowCreatedInWindow(const Row& row, const PurgeWindow& window);
 
   // Applies `visit` to every table in `table_ids`, or to every table when
   // `table_ids` is empty. Unknown ids are skipped.

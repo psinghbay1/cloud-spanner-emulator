@@ -61,6 +61,9 @@ type Options struct {
 	CommitReservationWaitMs int
 	// Forwarded to emulator_main as --storage_purge_interval when set.
 	StoragePurgeInterval string
+	// Forwarded to emulator_main as --enable_emulator_diagnostic_statements
+	// when true.
+	EnableEmulatorDiagnosticStatements bool
 }
 
 // Gateway implements the emulator gateway server.
@@ -110,6 +113,9 @@ func (gw *Gateway) emulatorArgs() []string {
 	if gw.opts.StoragePurgeInterval != "" {
 		emulatorArgs = append(emulatorArgs,
 			"--storage_purge_interval="+gw.opts.StoragePurgeInterval)
+	}
+	if gw.opts.EnableEmulatorDiagnosticStatements {
+		emulatorArgs = append(emulatorArgs, "--enable_emulator_diagnostic_statements")
 	}
 	return emulatorArgs
 }

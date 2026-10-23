@@ -37,3 +37,17 @@ func TestEmulatorArgsOmitUnsetStoragePurgeInterval(t *testing.T) {
 		}
 	}
 }
+
+func TestEmulatorArgsForwardDiagnosticStatements(t *testing.T) {
+	gw := New(Options{FrontendAddress: "localhost:9010", EnableEmulatorDiagnosticStatements: true})
+	if args := gw.emulatorArgs(); !slices.Contains(args, "--enable_emulator_diagnostic_statements") {
+		t.Errorf("enable_emulator_diagnostic_statements not forwarded: %v", args)
+	}
+}
+
+func TestEmulatorArgsOmitDiagnosticStatementsByDefault(t *testing.T) {
+	gw := New(Options{FrontendAddress: "localhost:9010"})
+	if args := gw.emulatorArgs(); slices.Contains(args, "--enable_emulator_diagnostic_statements") {
+		t.Errorf("diagnostic statements must be off by default: %v", args)
+	}
+}

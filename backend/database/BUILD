@@ -76,6 +76,7 @@ cc_test(
         "//backend/access:read",
         "//backend/datamodel:key_set",
         "//backend/schema/updater:schema_updater",
+        "//backend/storage",
         "//backend/transaction:read_only_transaction",
         "//common:clock",
         "//common:config",

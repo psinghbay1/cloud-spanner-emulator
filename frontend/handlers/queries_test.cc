@@ -1388,6 +1388,226 @@ TEST_P(QueryApiTest, QueryInTransactionAbortedBySchemaChangeFails) {
               StatusIs(absl::StatusCode::kAborted));
 }
 
+// Without --enable_emulator_diagnostic_statements the diagnostic statements
+// are ordinary queries naming unknown functions, as on Cloud Spanner.
+TEST_P(QueryApiTest, EmulatorReclaimRejectedWhenFlagOff) {
+  ASSERT_FALSE(config::enable_emulator_diagnostic_statements());
+  spanner_api::ExecuteSqlRequest request = PARSE_TEXT_PROTO(
+      R"pb(
+        transaction { single_use { read_only { strong: true } } }
+        sql: "SELECT EMULATOR_RECLAIM()"
+      )pb");
+  request.set_session(
+      GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
+
+  spanner_api::ResultSet response;
+  EXPECT_THAT(ExecuteSql(request, &response),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  std::vector<spanner_api::PartialResultSet> stream_response;
+  EXPECT_THAT(ExecuteStreamingSql(request, &stream_response),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST_P(QueryApiTest, EmulatorLockStatsRejectedWhenFlagOff) {
+  ASSERT_FALSE(config::enable_emulator_diagnostic_statements());
+  spanner_api::ExecuteSqlRequest request = PARSE_TEXT_PROTO(
+      R"pb(
+        transaction { single_use { read_only { strong: true } } }
+        sql: "SELECT EMULATOR_LOCK_STATS()"
+      )pb");
+  request.set_session(
+      GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
+
+  spanner_api::ResultSet response;
+  EXPECT_THAT(ExecuteSql(request, &response),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  std::vector<spanner_api::PartialResultSet> stream_response;
+  EXPECT_THAT(ExecuteStreamingSql(request, &stream_response),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+class DiagnosticStatementsTest : public QueryApiTest {
+ protected:
+  void SetUp() override {
+    config::set_enable_emulator_diagnostic_statements(true);
+    QueryApiTest::SetUp();
+  }
+  void TearDown() override {
+    config::set_enable_emulator_diagnostic_statements(false);
+    QueryApiTest::TearDown();
+  }
+
+  spanner_api::ExecuteSqlRequest Request(absl::string_view sql) {
+    spanner_api::ExecuteSqlRequest request;
+    request.set_sql(std::string(sql));
+    request.set_session(
+        GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
+    return request;
+  }
+
+  absl::Status Reclaim(absl::string_view sql) {
+    spanner_api::ResultSet response;
+    return ExecuteSql(Request(sql), &response);
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(SessionTypes, DiagnosticStatementsTest,
+                         testing::Values(SessionType::kRegularSession,
+                                         SessionType::kMultiplexedSession));
+
+TEST_P(DiagnosticStatementsTest, EmulatorReclaimReturnsCounters) {
+  spanner_api::ResultSet response;
+  GOOGLESQL_ASSERT_OK(ExecuteSql(Request("SELECT EMULATOR_RECLAIM()"), &response));
+  EXPECT_THAT(response, Partially(EqualsProto(
+                            R"pb(
+                              metadata {
+                                row_type {
+                                  fields {
+                                    name: "rows_purged"
+                                    type { code: INT64 }
+                                  }
+                                  fields {
+                                    name: "versions_purged"
+                                    type { code: INT64 }
+                                  }
+                                  fields {
+                                    name: "rows_deleted"
+                                    type { code: INT64 }
+                                  }
+                                }
+                              }
+                            )pb")));
+  ASSERT_EQ(response.rows_size(), 1);
+  EXPECT_EQ(response.rows(0).values_size(), 3);
+  EXPECT_EQ(response.rows(0).values(2).string_value(), "0");
+}
+
+TEST_P(DiagnosticStatementsTest, EmulatorReclaimViaStreamingReturnsCounters) {
+  std::vector<spanner_api::PartialResultSet> response;
+  GOOGLESQL_ASSERT_OK(ExecuteStreamingSql(Request("select emulator_reclaim();"),
+                                &response));
+  ASSERT_EQ(response.size(), 1);
+  ASSERT_EQ(response[0].metadata().row_type().fields_size(), 3);
+  EXPECT_EQ(response[0].metadata().row_type().fields(0).name(), "rows_purged");
+  EXPECT_EQ(response[0].values_size(), 3);
+}
+
+TEST_P(DiagnosticStatementsTest, EmulatorReclaimAcceptsTableNames) {
+  GOOGLESQL_EXPECT_OK(Reclaim("SELECT EMULATOR_RECLAIM('test_table')"));
+}
+
+TEST_P(DiagnosticStatementsTest,
+       EmulatorReclaimAcceptsTableNameWithNamedArguments) {
+  GOOGLESQL_EXPECT_OK(Reclaim(
+      "SELECT EMULATOR_RECLAIM('test_table', not_after_lag => '60s')"));
+}
+
+TEST_P(DiagnosticStatementsTest, EmulatorReclaimAcceptsWindowBounds) {
+  GOOGLESQL_EXPECT_OK(Reclaim(
+      "SELECT EMULATOR_RECLAIM(not_before => '2020-01-01T00:00:00Z', "
+      "not_after_lag => '60s')"));
+}
+
+// A malformed bound is rejected, not treated as "no bound", which would widen
+// the sweep.
+TEST_P(DiagnosticStatementsTest, EmulatorReclaimRejectsUnparseableTimestamp) {
+  EXPECT_THAT(
+      Reclaim("SELECT EMULATOR_RECLAIM(not_before => 'not-a-timestamp')"),
+      StatusIs(absl::StatusCode::kInvalidArgument));
+  std::vector<spanner_api::PartialResultSet> response;
+  EXPECT_THAT(
+      ExecuteStreamingSql(
+          Request("SELECT EMULATOR_RECLAIM(not_before => 'not-a-timestamp')"),
+          &response),
+      StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST_P(DiagnosticStatementsTest, EmulatorReclaimRejectsUnparseableDuration) {
+  EXPECT_THAT(
+      Reclaim("SELECT EMULATOR_RECLAIM(not_after_lag => 'not-a-duration')"),
+      StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST_P(DiagnosticStatementsTest, EmulatorReclaimRejectsInvertedWindow) {
+  EXPECT_THAT(Reclaim("SELECT EMULATOR_RECLAIM(not_before => "
+                      "'2030-01-01T00:00:00Z', not_after => "
+                      "'2020-01-01T00:00:00Z')"),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST_P(DiagnosticStatementsTest, EmulatorReclaimRejectsBothUpperBounds) {
+  EXPECT_THAT(Reclaim("SELECT EMULATOR_RECLAIM(not_after => "
+                      "'2030-01-01T00:00:00Z', not_after_lag => '60s')"),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST_P(DiagnosticStatementsTest, EmulatorReclaimRejectsUnknownArgument) {
+  EXPECT_THAT(Reclaim("SELECT EMULATOR_RECLAIM(prune_sessions => true)"),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST_P(DiagnosticStatementsTest, EmulatorReclaimRejectsUnquotedTableName) {
+  EXPECT_THAT(Reclaim("SELECT EMULATOR_RECLAIM(test_table)"),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+// Unbounded, delete_rows would empty every table in scope.
+TEST_P(DiagnosticStatementsTest, EmulatorReclaimRejectsUnboundedDeleteRows) {
+  EXPECT_THAT(Reclaim("SELECT EMULATOR_RECLAIM(delete_rows => true)"),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST_P(DiagnosticStatementsTest, EmulatorReclaimAcceptsBoundedDeleteRows) {
+  GOOGLESQL_EXPECT_OK(Reclaim(
+      "SELECT EMULATOR_RECLAIM(not_before => '2020-01-01T00:00:00Z', "
+      "delete_rows => true)"));
+}
+
+// Rows committed at or before not_before survive a destructive sweep. The
+// fixture populates test_table before the test, so it stands in for seed data.
+TEST_P(DiagnosticStatementsTest,
+       EmulatorReclaimKeepsRowsCommittedBeforeNotBefore) {
+  spanner_api::ResultSet reclaim_response;
+  GOOGLESQL_ASSERT_OK(ExecuteSql(
+      Request("SELECT EMULATOR_RECLAIM(not_before => '2030-01-01T00:00:00Z', "
+              "delete_rows => true)"),
+      &reclaim_response));
+  ASSERT_EQ(reclaim_response.rows_size(), 1);
+  EXPECT_EQ(reclaim_response.rows(0).values(2).string_value(), "0");
+
+  spanner_api::ExecuteSqlRequest select = PARSE_TEXT_PROTO(
+      R"(
+        transaction { single_use { read_only { strong: true } } }
+        sql: "SELECT COUNT(*) FROM test_table"
+      )");
+  select.set_session(
+      GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
+  spanner_api::ResultSet select_response;
+  GOOGLESQL_ASSERT_OK(ExecuteSql(select, &select_response));
+  ASSERT_EQ(select_response.rows_size(), 1);
+  EXPECT_NE(select_response.rows(0).values(0).string_value(), "0");
+}
+
+TEST_P(DiagnosticStatementsTest, EmulatorLockStatsReturnsColumns) {
+  spanner_api::ResultSet response;
+  GOOGLESQL_ASSERT_OK(
+      ExecuteSql(Request("SELECT EMULATOR_LOCK_STATS();"), &response));
+  ASSERT_EQ(response.metadata().row_type().fields_size(), 6);
+  EXPECT_EQ(response.metadata().row_type().fields(0).name(), "table_name");
+  EXPECT_EQ(response.metadata().row_type().fields(5).name(),
+            "last_conflict_time");
+}
+
+TEST_P(DiagnosticStatementsTest, EmulatorLockStatsViaStreamingReturnsColumns) {
+  std::vector<spanner_api::PartialResultSet> response;
+  GOOGLESQL_ASSERT_OK(
+      ExecuteStreamingSql(Request("select emulator_lock_stats()"), &response));
+  ASSERT_EQ(response.size(), 1);
+  ASSERT_EQ(response[0].metadata().row_type().fields_size(), 6);
+  EXPECT_EQ(response[0].metadata().row_type().fields(0).name(), "table_name");
+  EXPECT_EQ(response[0].values_size() % 6, 0);
+}
+
 }  // namespace
 
 }  // namespace frontend

@@ -32,6 +32,7 @@
 #include "backend/access/read.h"
 #include "backend/datamodel/key_set.h"
 #include "backend/schema/updater/schema_updater.h"
+#include "backend/storage/storage.h"
 #include "backend/transaction/options.h"
 #include "common/clock.h"
 #include "common/config.h"
@@ -418,6 +419,61 @@ TEST_F(DatabaseReclaimTest, BackgroundPurgeRunsAtInterval) {
 
   // Returns only once the purge thread has stopped.
   database.reset();
+}
+
+TEST_F(DatabaseReclaimTest, DeleteRowsInWindowErasesLiveRowsOfNamedTable) {
+  std::unique_ptr<Database> database = CreateDatabase();
+  Mutation insert;
+  insert.AddWriteOp(MutationOpType::kInsert, "T", {"k1", "k2"},
+                    {{Int64(1), Int64(1)}});
+  Apply(database.get(), insert);
+
+  PurgeWindow window;
+  window.not_after = clock_.Now();
+  Database::ReclaimStats stats = database->ReclaimStorage(
+      {"T"}, window, /*delete_rows_in_window=*/true);
+  EXPECT_EQ(stats.rows_deleted, 1);
+
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<ReadOnlyTransaction> txn,
+      database->CreateReadOnlyTransaction(ReadOnlyOptions()));
+  std::unique_ptr<RowCursor> row_cursor;
+  GOOGLESQL_ASSERT_OK(txn->Read(read_column("T", "k2"), &row_cursor));
+  EXPECT_FALSE(row_cursor->Next());
+}
+
+TEST_F(DatabaseReclaimTest, DeleteRowsInWindowKeepsRowsAtOrBeforeNotBefore) {
+  std::unique_ptr<Database> database = CreateDatabase();
+  Mutation insert;
+  insert.AddWriteOp(MutationOpType::kInsert, "T", {"k1", "k2"},
+                    {{Int64(1), Int64(1)}});
+  Apply(database.get(), insert);
+
+  PurgeWindow window;
+  window.not_before = clock_.Now();
+  Database::ReclaimStats stats = database->ReclaimStorage(
+      {"T"}, window, /*delete_rows_in_window=*/true);
+  EXPECT_EQ(stats.rows_deleted, 0);
+}
+
+TEST_F(DatabaseReclaimTest, UnknownTableNamesSweepNothing) {
+  std::unique_ptr<Database> database = CreateDatabase();
+  Mutation insert;
+  insert.AddWriteOp(MutationOpType::kInsert, "T", {"k1", "k2"},
+                    {{Int64(1), Int64(1)}});
+  Apply(database.get(), insert);
+
+  PurgeWindow window;
+  window.not_after = clock_.Now();
+  Database::ReclaimStats stats = database->ReclaimStorage(
+      {"NoSuchTable"}, window, /*delete_rows_in_window=*/true);
+  EXPECT_EQ(stats.rows_deleted, 0);
+}
+
+TEST_F(DatabaseReclaimTest, LockConflictStatsByTableEmptyWithoutConflicts) {
+  std::unique_ptr<Database> database = CreateDatabase();
+  InsertThenDeleteRow(database.get());
+  EXPECT_TRUE(database->LockConflictStatsByTable().empty());
 }
 
 }  // namespace

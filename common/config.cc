@@ -74,6 +74,13 @@ ABSL_FLAG(absl::Duration, storage_purge_interval, absl::ZeroDuration(),
           "memory to the OS where the allocator supports it. Zero (the "
           "default) disables the sweep.");
 
+ABSL_FLAG(bool, enable_emulator_diagnostic_statements, false,
+          "If true, the emulator answers the emulator-only statements "
+          "SELECT EMULATOR_RECLAIM(...), which reclaims storage and can "
+          "delete rows, and SELECT EMULATOR_LOCK_STATS(), which reports "
+          "lock conflicts per table. Intended for test environments only. "
+          "If false (the default), both fail as unknown functions.");
+
 namespace google {
 namespace spanner {
 namespace emulator {
@@ -121,6 +128,14 @@ absl::Duration storage_purge_interval() {
 
 void set_storage_purge_interval(absl::Duration interval) {
   absl::SetFlag(&FLAGS_storage_purge_interval, interval);
+}
+
+bool enable_emulator_diagnostic_statements() {
+  return absl::GetFlag(FLAGS_enable_emulator_diagnostic_statements);
+}
+
+void set_enable_emulator_diagnostic_statements(bool enabled) {
+  absl::SetFlag(&FLAGS_enable_emulator_diagnostic_statements, enabled);
 }
 
 }  // namespace config

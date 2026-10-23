@@ -79,6 +79,10 @@ var (
 		"With --enable_key_range_locking, how long in milliseconds a committing transaction "+
 			"waits for another commit to finish before it is aborted. 0 aborts at once. "+
 			"Negative (the default) keeps the emulator's default of 5000.")
+	enableEmulatorDiagnosticStatements = flag.Bool("enable_emulator_diagnostic_statements", false,
+		"If true, the emulator answers SELECT EMULATOR_RECLAIM(...) and "+
+			"SELECT EMULATOR_LOCK_STATS(). EMULATOR_RECLAIM can delete rows; test "+
+			"environments only. Off by default: both fail as unknown functions.")
 )
 
 // resolveGRPCBinary figures out the full path to the grpc binary from the --grpc_binary flag.
@@ -185,6 +189,7 @@ func main() {
 		EnableKeyRangeLocking:                          *enableKeyRangeLocking,
 		CommitReservationWaitMs:                        *commitReservationWaitMs,
 		StoragePurgeInterval:                           storagePurgeInterval,
+		EnableEmulatorDiagnosticStatements:             *enableEmulatorDiagnosticStatements,
 	}
 	gw := gateway.New(gwopts)
 	gw.Run()

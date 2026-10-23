@@ -18,6 +18,7 @@
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_DATABASE_DATABASE_H_
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>  // NOLINT
@@ -133,6 +134,8 @@ class Database {
   struct ReclaimStats {
     int64_t rows_purged = 0;
     int64_t versions_purged = 0;
+    // Live rows erased on request; always 0 for the background sweep.
+    int64_t rows_deleted = 0;
   };
 
   // Reclaims memory held by data no transaction can read any more: deleted
@@ -149,6 +152,25 @@ class Database {
   // As ReclaimStorage(), with the retention floor computed from `now`.
   ReclaimStats ReclaimStorage(absl::Time now);
 
+  // As ReclaimStorage(), scoped and bounded by the caller.
+  //
+  // `table_names` limits the sweep to those tables and their indexes; an empty
+  // vector sweeps the whole database. Unknown names are ignored, so a caller
+  // sweeping a fixed list need not track schema changes. `window` bounds the
+  // sweep by commit timestamp; see PurgeWindow.
+  //
+  // `delete_rows_in_window` also erases LIVE rows first written inside
+  // `window`. It destroys data the application can still read and is meant
+  // only for a test harness clearing its own rows between batches.
+  ReclaimStats ReclaimStorage(const std::vector<std::string>& table_names,
+                              const PurgeWindow& window,
+                              bool delete_rows_in_window);
+
+  // Lock-conflict totals since startup, keyed by table name. Index data is
+  // reported as "Table.Index", the database-wide schema lock as "(database)",
+  // and a table since dropped by its storage id.
+  std::map<std::string, LockConflictStats> LockConflictStatsByTable();
+
   // Number of sweeps completed by the background storage purge.
   int64_t background_purge_count() const ABSL_LOCKS_EXCLUDED(purge_mu_);
 
@@ -159,6 +181,12 @@ class Database {
   Database& operator=(const Database&) = delete;
 
   SchemaChangeContext GetSchemaChangeContext();
+
+  // Shared body of the ReclaimStorage() overloads.
+  ReclaimStats ReclaimTableIds(absl::Time now,
+                               const std::vector<TableID>& table_ids,
+                               const PurgeWindow& window,
+                               bool delete_rows_in_window);
 
   // Runs ReclaimStorage() every `interval` until the destructor signals stop.
   void RunStoragePurgeLoop(absl::Duration interval)

@@ -17,9 +17,12 @@
 #include "backend/database/database.h"
 
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <string>
 #include <thread>  // NOLINT
 #include <utility>
+#include <vector>
 
 #ifdef __GLIBC__
 #include <malloc.h>
@@ -31,6 +34,7 @@
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
@@ -42,8 +46,10 @@
 #include "backend/database/pg_oid_assigner/pg_oid_assigner.h"
 #include "backend/locking/manager.h"
 #include "backend/query/query_engine.h"
+#include "backend/schema/catalog/index.h"
 #include "backend/schema/catalog/proto_bundle.h"
 #include "backend/schema/catalog/schema.h"
+#include "backend/schema/catalog/table.h"
 #include "backend/schema/catalog/versioned_catalog.h"
 #include "backend/schema/graph/schema_graph.h"
 #include "backend/schema/updater/schema_updater.h"
@@ -175,9 +181,50 @@ Database::ReclaimStats Database::ReclaimStorage() {
 }
 
 Database::ReclaimStats Database::ReclaimStorage(absl::Time now) {
+  return ReclaimTableIds(now, /*table_ids=*/{}, PurgeWindow{},
+                         /*delete_rows_in_window=*/false);
+}
+
+Database::ReclaimStats Database::ReclaimStorage(
+    const std::vector<std::string>& table_names, const PurgeWindow& window,
+    bool delete_rows_in_window) {
+  // An index keeps its rows in its own data table, so sweeping a table also
+  // sweeps the indexes defined on it.
+  std::vector<TableID> table_ids;
+  const Schema* schema = versioned_catalog_->GetLatestSchema();
+  for (const std::string& table_name : table_names) {
+    const Table* table = schema->FindTable(table_name);
+    if (table == nullptr) {
+      continue;
+    }
+    table_ids.push_back(table->id());
+    for (const Index* index : table->indexes()) {
+      if (index->index_data_table() != nullptr) {
+        table_ids.push_back(index->index_data_table()->id());
+      }
+    }
+  }
+  // Every name was unknown: sweep nothing rather than fall back to the whole
+  // database, which an empty id list means to storage.
+  if (!table_names.empty() && table_ids.empty()) {
+    return ReclaimStats{};
+  }
+  return ReclaimTableIds(clock_->Now(), table_ids, window,
+                         delete_rows_in_window);
+}
+
+Database::ReclaimStats Database::ReclaimTableIds(
+    absl::Time now, const std::vector<TableID>& table_ids,
+    const PurgeWindow& window, bool delete_rows_in_window) {
   ReclaimStats stats;
-  stats.rows_purged = storage_->PurgeExpiredDeletedRows(now, {});
-  stats.versions_purged = storage_->PurgeExpiredVersions(now, {});
+  // Deleting a live row removes its versions too, so this goes first and
+  // leaves the purge sweeps less to walk.
+  if (delete_rows_in_window) {
+    stats.rows_deleted = storage_->DeleteRowsInWindow(table_ids, window);
+  }
+  stats.rows_purged = storage_->PurgeExpiredDeletedRows(now, table_ids, window);
+  stats.versions_purged =
+      storage_->PurgeExpiredVersions(now, table_ids, window);
   // Otherwise these only run on a schema change, so an idle database never
   // reclaims dropped tables and columns.
   storage_->CleanUpDeletedTables(now);
@@ -188,6 +235,30 @@ Database::ReclaimStats Database::ReclaimStorage(absl::Time now) {
 #endif
   return stats;
 }
+
+std::map<std::string, LockConflictStats> Database::LockConflictStatsByTable() {
+  std::map<TableID, std::string> names;
+  const Schema* schema = versioned_catalog_->GetLatestSchema();
+  for (const Table* table : schema->tables()) {
+    names[table->id()] = table->Name();
+    for (const Index* index : table->indexes()) {
+      if (index->index_data_table() != nullptr) {
+        names[index->index_data_table()->id()] =
+            absl::StrCat(table->Name(), ".", index->Name());
+      }
+    }
+  }
+  std::map<std::string, LockConflictStats> by_name;
+  for (const auto& [table_id, stats] : lock_manager_->ConflictStats()) {
+    std::string name = table_id.empty() ? "(database)" : table_id;
+    if (auto found = names.find(table_id); found != names.end()) {
+      name = found->second;
+    }
+    by_name[name] = stats;
+  }
+  return by_name;
+}
+
 absl::StatusOr<std::unique_ptr<ReadOnlyTransaction>>
 Database::CreateReadOnlyTransaction(const ReadOnlyOptions& options) {
   return std::make_unique<ReadOnlyTransaction>(
