@@ -19,6 +19,8 @@
 
 #include <string>
 
+#include "absl/time/time.h"
+
 namespace google {
 namespace spanner {
 namespace emulator {
@@ -65,6 +67,13 @@ void set_enable_key_range_locking(bool enabled);
 // aborted. 0 means abort at once. Ignored when key-range locking is off.
 int commit_reservation_wait_ms();
 void set_commit_reservation_wait_ms(int wait_ms);
+
+// Interval of the background sweep that erases deleted rows and superseded
+// versions older than the version retention period. A non-positive or infinite
+// value disables the sweep, which is the default.
+absl::Duration storage_purge_interval();
+
+void set_storage_purge_interval(absl::Duration interval);
 
 }  // namespace config
 }  // namespace emulator

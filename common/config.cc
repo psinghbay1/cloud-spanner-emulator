@@ -19,6 +19,7 @@
 #include <string>
 
 #include "absl/flags/flag.h"
+#include "absl/time/time.h"
 
 ABSL_FLAG(std::string, host_port, "localhost:10007",
           "Emulator host IP and port that serves Cloud Spanner gRPC requests.");
@@ -66,6 +67,13 @@ ABSL_FLAG(
     "timestamp before it is aborted. 0 aborts at once. Ignored when key-range "
     "locking is disabled.");
 
+ABSL_FLAG(absl::Duration, storage_purge_interval, absl::ZeroDuration(),
+          "If positive, every database runs a background sweep at this "
+          "interval that erases deleted rows and superseded versions older "
+          "than the database's version_retention_period, then returns freed "
+          "memory to the OS where the allocator supports it. Zero (the "
+          "default) disables the sweep.");
+
 namespace google {
 namespace spanner {
 namespace emulator {
@@ -105,6 +113,14 @@ int commit_reservation_wait_ms() {
 
 void set_commit_reservation_wait_ms(int wait_ms) {
   absl::SetFlag(&FLAGS_commit_reservation_wait_ms, wait_ms);
+}
+
+absl::Duration storage_purge_interval() {
+  return absl::GetFlag(FLAGS_storage_purge_interval);
+}
+
+void set_storage_purge_interval(absl::Duration interval) {
+  absl::SetFlag(&FLAGS_storage_purge_interval, interval);
 }
 
 }  // namespace config

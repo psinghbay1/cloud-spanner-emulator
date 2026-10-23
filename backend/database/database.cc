@@ -16,9 +16,14 @@
 
 #include "backend/database/database.h"
 
+#include <cstdint>
 #include <memory>
 #include <thread>  // NOLINT
 #include <utility>
+
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 #include "google/spanner/admin/database/v1/common.pb.h"
 #include "googlesql/public/types/type_factory.h"
@@ -27,6 +32,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/variant.h"
@@ -47,6 +53,7 @@
 #include "backend/transaction/read_only_transaction.h"
 #include "backend/transaction/read_write_transaction.h"
 #include "common/clock.h"
+#include "common/config.h"
 #include "common/errors.h"
 #include "googlesql/base/status_macros.h"
 #include "absl/status/status.h"
@@ -122,7 +129,64 @@ absl::StatusOr<std::unique_ptr<Database>> Database::Create(
   database->storage_->SetVersionRetentionPeriod(
       database->versioned_catalog_->version_retention_period());
 
+  const absl::Duration purge_interval = config::storage_purge_interval();
+  if (purge_interval > absl::ZeroDuration() &&
+      purge_interval != absl::InfiniteDuration()) {
+    database->purge_thread_ = std::thread(&Database::RunStoragePurgeLoop,
+                                          database.get(), purge_interval);
+  }
+
   return database;
+}
+
+Database::~Database() {
+  if (purge_thread_.joinable()) {
+    {
+      absl::MutexLock lock(purge_mu_);
+      stop_purge_ = true;
+    }
+    purge_thread_.join();
+  }
+}
+
+void Database::RunStoragePurgeLoop(absl::Duration interval) {
+  while (true) {
+    {
+      absl::MutexLock lock(purge_mu_);
+      if (purge_mu_.AwaitWithTimeout(absl::Condition(&stop_purge_),
+                                     interval)) {
+        return;
+      }
+    }
+    // Not under purge_mu_, so the destructor never waits on a sweep to start.
+    ReclaimStorage();
+    absl::MutexLock lock(purge_mu_);
+    ++background_purge_count_;
+  }
+}
+
+int64_t Database::background_purge_count() const {
+  absl::MutexLock lock(purge_mu_);
+  return background_purge_count_;
+}
+
+Database::ReclaimStats Database::ReclaimStorage() {
+  return ReclaimStorage(clock_->Now());
+}
+
+Database::ReclaimStats Database::ReclaimStorage(absl::Time now) {
+  ReclaimStats stats;
+  stats.rows_purged = storage_->PurgeExpiredDeletedRows(now, {});
+  stats.versions_purged = storage_->PurgeExpiredVersions(now, {});
+  // Otherwise these only run on a schema change, so an idle database never
+  // reclaims dropped tables and columns.
+  storage_->CleanUpDeletedTables(now);
+  storage_->CleanUpDeletedColumns(now);
+#ifdef __GLIBC__
+  // Erased map nodes go back to malloc's free lists, not to the OS.
+  malloc_trim(0);
+#endif
+  return stats;
 }
 absl::StatusOr<std::unique_ptr<ReadOnlyTransaction>>
 Database::CreateReadOnlyTransaction(const ReadOnlyOptions& options) {
