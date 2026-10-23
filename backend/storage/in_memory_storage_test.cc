@@ -826,6 +826,45 @@ TEST_F(InMemoryStorageTest, RemoveExpiredVersionsFromCellOnDelete) {
   EXPECT_THAT(values, testing::ElementsAre(googlesql::Value()));
 }
 
+TEST_F(InMemoryStorageTest, CleanUpDeletedTablesErasesTablesDroppedTogether) {
+  absl::Time t0 = absl::Now();
+  GOOGLESQL_EXPECT_OK(storage_.Write(t0, kTableId0, Key({Int64(1)}), {kColumnID},
+                           {String("value-1")}));
+  GOOGLESQL_EXPECT_OK(storage_.Write(t0, kTableId1, Key({Int64(10)}), {kColumnID},
+                           {String("value-10")}));
+
+  // One schema change drops both tables at the same timestamp.
+  absl::Time t1 = t0 + absl::Seconds(1);
+  storage_.MarkDroppedTable(t1, kTableId0);
+  storage_.MarkDroppedTable(t1, kTableId1);
+  storage_.CleanUpDeletedTables(absl::InfiniteFuture());
+
+  EXPECT_THAT(storage_.Lookup(t0, kTableId0, Key({Int64(1)}), {}, nullptr),
+              googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(storage_.Lookup(t0, kTableId1, Key({Int64(10)}), {}, nullptr),
+              googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST_F(InMemoryStorageTest, CleanUpDeletedColumnsErasesColumnsDroppedTogether) {
+  absl::Time t0 = absl::Now();
+  const ColumnID kOtherColumnID = "test_column:1";
+  GOOGLESQL_EXPECT_OK(storage_.Write(t0, kTableId0, Key({Int64(1)}),
+                           {kColumnID, kOtherColumnID},
+                           {String("value-1"), String("value-2")}));
+
+  // One schema change drops both columns at the same timestamp.
+  absl::Time t1 = t0 + absl::Seconds(1);
+  storage_.MarkDroppedColumn(t1, kTableId0, kColumnID);
+  storage_.MarkDroppedColumn(t1, kTableId0, kOtherColumnID);
+  storage_.CleanUpDeletedColumns(absl::InfiniteFuture());
+
+  std::vector<googlesql::Value> values;
+  GOOGLESQL_EXPECT_OK(storage_.Lookup(t0, kTableId0, Key({Int64(1)}),
+                            {kColumnID, kOtherColumnID}, &values));
+  EXPECT_THAT(values,
+              testing::ElementsAre(googlesql::Value(), googlesql::Value()));
+}
+
 }  // namespace
 
 }  // namespace backend
