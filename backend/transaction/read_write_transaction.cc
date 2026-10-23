@@ -362,6 +362,7 @@ absl::Status ReadWriteTransaction::GuardedCall(
     }
     case State::kUninitialized: {
       schema_ = versioned_catalog_->GetLatestSchema();
+      schema_time_ = versioned_catalog_->LatestSchemaTime();
       auto maybe_action_registry =
           action_manager_->GetActionsForSchema(schema_);
       if (!maybe_action_registry.ok()) {
@@ -377,7 +378,8 @@ absl::Status ReadWriteTransaction::GuardedCall(
       if (schema_ != versioned_catalog_->GetLatestSchema()) {
         Reset();
         ++retry_state_.abort_retry_count;
-        return error::AbortDueToConcurrentSchemaChange(id_);
+        return error::AbortDueToConcurrentSchemaChange(
+            id_, schema_time_, versioned_catalog_->LatestSchemaTime());
       }
       break;
     }

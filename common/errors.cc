@@ -788,6 +788,21 @@ absl::Status AbortDueToConcurrentSchemaChange(backend::TransactionID id) {
                    " aborted due to concurrent schema change."));
 }
 
+absl::Status AbortDueToConcurrentSchemaChange(backend::TransactionID id,
+                                              absl::Time started_on_schema,
+                                              absl::Time latest_schema) {
+  return absl::Status(
+      absl::StatusCode::kAborted,
+      absl::StrCat("Transaction: ", id,
+                   " aborted due to concurrent schema change. Transaction "
+                   "started on schema version ",
+                   absl::FormatTime(started_on_schema),
+                   ", latest schema version is ",
+                   absl::FormatTime(latest_schema), " (gap ",
+                   absl::FormatDuration(latest_schema - started_on_schema),
+                   ")."));
+}
+
 absl::Status AbortReadWriteTransactionOnFirstCommit(backend::TransactionID id) {
   return absl::Status(
       absl::StatusCode::kAborted,

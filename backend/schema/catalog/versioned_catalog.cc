@@ -77,6 +77,11 @@ const Schema* VersionedCatalog::GetSchema(absl::Time timestamp) const {
   return itr->second.get();
 }
 
+absl::Time VersionedCatalog::LatestSchemaTime() const {
+  absl::MutexLock lock(mu_);
+  return schemas_.rbegin()->first;
+}
+
 const Schema* VersionedCatalog::GetLatestSchema() const {
   return GetSchema(absl::InfiniteFuture());
 }

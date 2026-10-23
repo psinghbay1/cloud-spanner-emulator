@@ -178,6 +178,9 @@ absl::Status CannotUseTransactionAfterConstraintError();
 absl::Status ReadTimestampPastVersionGCLimit(absl::Time timestamp);
 absl::Status ReadTimestampTooFarInFuture(absl::Time timestamp);
 absl::Status AbortDueToConcurrentSchemaChange(backend::TransactionID id);
+absl::Status AbortDueToConcurrentSchemaChange(backend::TransactionID id,
+                                              absl::Time started_on_schema,
+                                              absl::Time latest_schema);
 absl::Status AbortReadWriteTransactionOnFirstCommit(backend::TransactionID id);
 absl::Status UpdateDeletedRowInTransaction(absl::string_view table,
                                            absl::string_view key);

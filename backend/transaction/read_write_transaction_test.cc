@@ -61,6 +61,8 @@ using googlesql::values::Bytes;
 using googlesql::values::Int64;
 using googlesql::values::String;
 using googlesql_base::testing::StatusIs;
+using testing::AllOf;
+using testing::HasSubstr;
 
 class ReadWriteTransactionTest : public testing::Test {
  public:
@@ -531,7 +533,11 @@ TEST_F(ReadWriteTransactionTest, ConcurrentSchemaUpdatesWithTransactions) {
                                        type_factory_.get());
 
   // Transaction is aborted.
-  EXPECT_THAT(txn->Write(m), StatusIs(absl::StatusCode::kAborted));
+  EXPECT_THAT(
+      txn->Write(m),
+      StatusIs(absl::StatusCode::kAborted,
+               AllOf(HasSubstr("started on schema version"),
+                     HasSubstr("latest schema version is"), HasSubstr("gap"))));
 }
 
 TEST_F(ReadWriteTransactionTest, CommitWithNoEffectiveChangesToDatabase) {
