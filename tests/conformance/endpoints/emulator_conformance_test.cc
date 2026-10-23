@@ -22,6 +22,7 @@
 #include "gtest/gtest.h"
 #include "googlesql/base/testing/status_matchers.h"
 #include "tests/common/proto_matchers.h"
+#include "absl/time/time.h"
 #include "google/cloud/common_options.h"
 #include "google/cloud/grpc_options.h"
 #include "google/cloud/spanner/admin/instance_admin_client.h"
@@ -100,6 +101,15 @@ class EmulatorConformanceTestEnvironment : public testing::Environment {
     globals_->connection_options = std::move(connection_options);
     globals_->in_prod_env = false;
     SetConformanceTestGlobals(globals_.get());
+  }
+
+  // Stop the server while main is still running. Left to gtest's static
+  // teardown, it is destroyed after globals it uses, and exit can hang.
+  void TearDown() override {
+    if (server_ != nullptr) {
+      server_->Shutdown(absl::Seconds(5));
+      server_.reset();
+    }
   }
 
  private:

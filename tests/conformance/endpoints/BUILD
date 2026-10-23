@@ -35,6 +35,7 @@ cc_test(
         "//tests/conformance/cases",
         "//tests/conformance/common:environment",
         "@com_github_google_benchmark//:benchmark",
+        "@com_google_absl//absl/time",
         "@com_github_googleapis_google_cloud_cpp//:common",
         "@com_github_googleapis_google_cloud_cpp//:grpc_utils",
         "@com_github_googleapis_google_cloud_cpp//:spanner",

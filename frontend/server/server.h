@@ -20,6 +20,7 @@
 #include <memory>
 #include <string>
 
+#include "absl/time/time.h"
 #include "frontend/server/environment.h"
 #include "grpcpp/impl/service_type.h"
 #include "grpcpp/server.h"
@@ -67,6 +68,9 @@ class Server {
 
   // Shuts down the grpc server.
   void Shutdown();
+
+  // Shuts down the grpc server, cancelling RPCs still running after `grace`.
+  void Shutdown(absl::Duration grace);
 
   // Accessor to the ServerEnv of the server.
   ServerEnv* env() { return env_.get(); }
