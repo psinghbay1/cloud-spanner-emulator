@@ -21,12 +21,16 @@
 #include <vector>
 
 #include "gmock/gmock.h"
+#include "google/protobuf/empty.pb.h"
 #include "gtest/gtest.h"
 #include "googlesql/base/testing/status_matchers.h"
 #include "tests/common/proto_matchers.h"
 #include "absl/status/status.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
+#include "common/config.h"
 #include "frontend/entities/operation.h"
 
 namespace google {
@@ -36,9 +40,13 @@ namespace frontend {
 
 class OperationManagerTest : public testing::Test {
  protected:
+  void SetUp() override { saved_retention_ = config::operation_retention(); }
+  void TearDown() override { config::set_operation_retention(saved_retention_); }
+
   OperationManager* manager() { return &manager_; }
 
  private:
+  absl::Duration saved_retention_;
   OperationManager manager_;
 };
 
@@ -194,6 +202,82 @@ TEST_F(OperationManagerTest, ListsOperationsWithSimilarInstanceURI) {
   operations[0]->ToProto(&operation_pb);
   EXPECT_EQ("projects/test-project/instances/test-instance-a/operations/1",
             operation_pb.name());
+}
+
+TEST_F(OperationManagerTest, PruneRemovesCompletedOperation) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Operation> operation,
+      manager()->CreateOperation("projects/123/instances/456", "789"));
+  operation->SetResponse(google::protobuf::Empty());
+
+  EXPECT_EQ(manager()->PruneOperationsDoneBefore(absl::InfiniteFuture()), 1);
+  EXPECT_THAT(
+      manager()->GetOperation("projects/123/instances/456/operations/789"),
+      googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST_F(OperationManagerTest, PruneRemovesFailedOperation) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Operation> operation,
+      manager()->CreateOperation("projects/123/instances/456", "789"));
+  operation->SetError(absl::InternalError("failed"));
+
+  EXPECT_EQ(manager()->PruneOperationsDoneBefore(absl::InfiniteFuture()), 1);
+}
+
+TEST_F(OperationManagerTest, PruneKeepsInFlightOperation) {
+  GOOGLESQL_ASSERT_OK(
+      manager()->CreateOperation("projects/123/instances/456", "789"));
+
+  EXPECT_EQ(manager()->PruneOperationsDoneBefore(absl::InfiniteFuture()), 0);
+  GOOGLESQL_EXPECT_OK(
+      manager()->GetOperation("projects/123/instances/456/operations/789"));
+}
+
+TEST_F(OperationManagerTest, PruneKeepsOperationDoneAfterTheBound) {
+  const absl::Time bound = absl::Now();
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Operation> operation,
+      manager()->CreateOperation("projects/123/instances/456", "789"));
+  absl::SleepFor(absl::Milliseconds(1));
+  operation->SetResponse(google::protobuf::Empty());
+
+  EXPECT_EQ(manager()->PruneOperationsDoneBefore(bound), 0);
+}
+
+TEST_F(OperationManagerTest, CreateOperationSweepsDoneOperationsWhenSet) {
+  config::set_operation_retention(absl::ZeroDuration());
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Operation> done,
+      manager()->CreateOperation("projects/123/instances/456", "done"));
+  done->SetResponse(google::protobuf::Empty());
+  GOOGLESQL_ASSERT_OK(
+      manager()->CreateOperation("projects/123/instances/456", "running"));
+  absl::SleepFor(absl::Milliseconds(1));
+
+  GOOGLESQL_ASSERT_OK(
+      manager()->CreateOperation("projects/123/instances/456", "next"));
+
+  EXPECT_THAT(
+      manager()->GetOperation("projects/123/instances/456/operations/done"),
+      googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
+  GOOGLESQL_EXPECT_OK(
+      manager()->GetOperation("projects/123/instances/456/operations/running"));
+}
+
+TEST_F(OperationManagerTest, CreateOperationNeverSweepsWhenRetentionIsUnset) {
+  ASSERT_EQ(config::operation_retention(), absl::InfiniteDuration());
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Operation> done,
+      manager()->CreateOperation("projects/123/instances/456", "done"));
+  done->SetResponse(google::protobuf::Empty());
+  absl::SleepFor(absl::Milliseconds(1));
+
+  GOOGLESQL_ASSERT_OK(
+      manager()->CreateOperation("projects/123/instances/456", "next"));
+
+  GOOGLESQL_EXPECT_OK(
+      manager()->GetOperation("projects/123/instances/456/operations/done"));
 }
 
 }  // namespace frontend

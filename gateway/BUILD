@@ -14,7 +14,7 @@
 # limitations under the License.
 #
 
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 load("//build/bazel:grpc_gateway.bzl", "generate_grpc_gateway")
 
 package(
@@ -76,4 +76,10 @@ go_library(
         "@org_golang_google_genproto_googleapis_rpc//errdetails",
         "@org_golang_google_grpc//:go_default_library",
     ],
+)
+
+go_test(
+    name = "gateway_test",
+    srcs = ["gateway_test.go"],
+    embed = [":gateway"],
 )

@@ -146,9 +146,11 @@ cc_library(
     hdrs = ["operation.h"],
     deps = [
         "//frontend/common:protos",
+        "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
         "@com_google_googleapis//google/longrunning:longrunning_cc_grpc",
         "@com_google_googleapis//google/rpc:status_cc_proto",
         "@com_google_protobuf//:protobuf_headers",

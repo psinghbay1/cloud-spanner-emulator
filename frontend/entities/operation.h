@@ -21,8 +21,10 @@
 
 #include "google/longrunning/operations.pb.h"
 #include "google/protobuf/message.h"
+#include "absl/base/thread_annotations.h"
 #include "absl/status/status.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "absl/status/status.h"
 
 namespace google {
@@ -58,12 +60,22 @@ class Operation {
   void ToProto(google::longrunning::Operation* operation_pb)
       ABSL_LOCKS_EXCLUDED(mu_);
 
+  // True once a response or an error has been set. Matches the `done` field
+  // ToProto() emits.
+  bool done() const ABSL_LOCKS_EXCLUDED(mu_);
+
+  // When the operation became done, or InfiniteFuture() while it is running.
+  absl::Time done_time() const ABSL_LOCKS_EXCLUDED(mu_);
+
  private:
+  // Records the completion time the first time the operation becomes done.
+  void MarkDone() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
   // The immutable URI for an operation.
   const std::string operation_uri_;
 
   // Mutex to guard state below.
-  absl::Mutex mu_;
+  mutable absl::Mutex mu_;
 
   // The metadata for this operation.
   std::unique_ptr<google::protobuf::Message> metadata_ ABSL_GUARDED_BY(mu_);
@@ -73,6 +85,9 @@ class Operation {
 
   // The status for this operation if this operation was not successful.
   absl::Status status_ ABSL_GUARDED_BY(mu_);
+
+  // Set when the operation first becomes done; drives retention pruning.
+  absl::Time done_time_ ABSL_GUARDED_BY(mu_) = absl::InfiniteFuture();
 };
 
 }  // namespace frontend

@@ -103,6 +103,7 @@ cc_library(
     deps = [
         ":multiplexed_session_transaction_manager",
         "//common:clock",
+        "//common:config",
         "//common:errors",
         "//frontend/common:labels",
         "//frontend/common:uris",
@@ -145,6 +146,7 @@ cc_test(
         ":database_manager",
         ":session_manager",
         "//common:clock",
+        "//common:config",
         "//common:errors",
         "//frontend/entities:database",
         "//frontend/entities:session",
@@ -239,6 +241,7 @@ cc_library(
     srcs = ["operation_manager.cc"],
     hdrs = ["operation_manager.h"],
     deps = [
+        "//common:config",
         "//common:errors",
         "//frontend/common:uris",
         "//frontend/entities:operation",
@@ -247,6 +250,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
     ],
 )
 
@@ -257,12 +261,15 @@ cc_test(
     ],
     deps = [
         ":operation_manager",
+        "//common:config",
         "//frontend/entities:operation",
         "//tests/common:proto_matchers",
         "@com_github_google_benchmark//:benchmark",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+        "@com_google_protobuf//:protobuf",
         "@com_google_googlesql//googlesql/base/testing:status_matchers",
         "@com_google_googletest//:gtest_main",
     ],

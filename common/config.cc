@@ -19,6 +19,7 @@
 #include <string>
 
 #include "absl/flags/flag.h"
+#include "absl/time/time.h"
 
 ABSL_FLAG(std::string, host_port, "localhost:10007",
           "Emulator host IP and port that serves Cloud Spanner gRPC requests.");
@@ -51,6 +52,22 @@ ABSL_FLAG(
     "to the current transaction. A value of zero means that the emulator will "
     "never abort the current transaction.");
 
+ABSL_FLAG(
+    absl::Duration, session_idle_timeout, absl::InfiniteDuration(),
+    "If set, regular (non-multiplexed) sessions unused for longer than this "
+    "are erased by a sweep that runs as new sessions are created, releasing "
+    "sessions that clients abandoned without calling DeleteSession. A later "
+    "request on a swept session fails with NOT_FOUND, as Cloud Spanner does "
+    "for an expired session. Unset (the default) never sweeps.");
+
+ABSL_FLAG(
+    absl::Duration, operation_retention, absl::InfiniteDuration(),
+    "If set, finished long-running operations (CreateDatabase, UpdateDdl, ...) "
+    "are erased this long after they complete, by a sweep that runs as new "
+    "operations are created. A swept operation can no longer be polled and "
+    "GetOperation returns NOT_FOUND. In-flight operations are never erased. "
+    "Unset (the default) keeps operations until DeleteOperation is called.");
+
 namespace google {
 namespace spanner {
 namespace emulator {
@@ -74,6 +91,22 @@ int abort_current_transaction_probability() {
 
 void set_abort_current_transaction_probability(int probability) {
   absl::SetFlag(&FLAGS_abort_current_transaction_probability, probability);
+}
+
+absl::Duration session_idle_timeout() {
+  return absl::GetFlag(FLAGS_session_idle_timeout);
+}
+
+void set_session_idle_timeout(absl::Duration timeout) {
+  absl::SetFlag(&FLAGS_session_idle_timeout, timeout);
+}
+
+absl::Duration operation_retention() {
+  return absl::GetFlag(FLAGS_operation_retention);
+}
+
+void set_operation_retention(absl::Duration retention) {
+  absl::SetFlag(&FLAGS_operation_retention, retention);
 }
 
 }  // namespace config

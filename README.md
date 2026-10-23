@@ -117,6 +117,50 @@ The first port is the gRPC port and the second port is the REST port.
 
 Works on x86 and arm64 architectures.
 
+## Optional features
+
+The features below are off by default. With their flags unset the emulator
+behaves exactly as described elsewhere in this document.
+
+### Pruning idle sessions and finished operations
+
+**Problem.** A long-running emulator shared by many test runs keeps every
+session a client never deletes and every finished long-running operation
+(one per `CreateDatabase` and `UpdateDdl`) in memory for the life of the
+process. Session expiry is lazy: an idle session is erased only if it is
+looked up again, which an abandoned session never is. Operations are erased
+only by `DeleteOperation`, which clients rarely call.
+
+**What the flags do.**
+
+| Flag (gateway_main / emulator_main) | Environment variable | Default | Effect |
+|---|---|---|---|
+| `--session_idle_timeout` | `SESSION_IDLE_TIMEOUT` | unset (never) | Regular sessions unused for longer than this are erased. The sweep runs as new sessions are created, at most once a minute. Multiplexed sessions are never swept. |
+| `--operation_retention` | `OPERATION_RETENTION` | unset (forever) | Finished operations are erased this long after they complete. The sweep runs as new operations are created. In-flight operations are never erased. |
+
+Values are durations such as `30m`, `90s` or `1h`. The environment variable,
+when set, overrides the `gateway_main` flag; unset values are not forwarded to
+`emulator_main`.
+
+**How to enable.**
+
+```shell
+./gateway_main --hostname 0.0.0.0 --session_idle_timeout=30m --operation_retention=10m
+
+docker run -p 9010:9010 -p 9020:9020 \
+  -e SESSION_IDLE_TIMEOUT=30m -e OPERATION_RETENTION=10m \
+  gcr.io/cloud-spanner-emulator/emulator
+```
+
+**Trade-offs.**
+
+* A request on a swept session fails with `NOT_FOUND` "Session not found",
+  as Cloud Spanner does for an expired session; client libraries recreate the
+  session. Choose a timeout longer than any session is legitimately idle.
+* A swept operation can no longer be polled: `GetOperation` returns
+  `NOT_FOUND`, as after `DeleteOperation`. Choose a retention longer than
+  clients take to poll a finished operation.
+
 ## Technical Details
 
 The Cloud Spanner Emulator is built using the [GoogleSQL](https://github.com/google/googlesql)
