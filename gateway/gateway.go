@@ -55,6 +55,10 @@ type Options struct {
 	OverrideMaxDatabasesPerInstance                int
 	OverrideChangeStreamPartitionTokenAliveSeconds int
 	RemoteFunctionsHostPort                        string
+	// Forwarded to emulator_main as --enable_key_range_locking when true.
+	EnableKeyRangeLocking bool
+	// Forwarded to emulator_main as --commit_reservation_wait_ms when >= 0.
+	CommitReservationWaitMs int
 }
 
 // Gateway implements the emulator gateway server.
@@ -95,6 +99,13 @@ func (gw *Gateway) Run() {
 	emulatorArgs = append(emulatorArgs,
 		fmt.Sprintf("--override_change_stream_partition_token_alive_seconds=%d",
 			gw.opts.OverrideChangeStreamPartitionTokenAliveSeconds))
+	if gw.opts.EnableKeyRangeLocking {
+		emulatorArgs = append(emulatorArgs, "--enable_key_range_locking")
+	}
+	if gw.opts.CommitReservationWaitMs >= 0 {
+		emulatorArgs = append(emulatorArgs,
+			fmt.Sprintf("--commit_reservation_wait_ms=%d", gw.opts.CommitReservationWaitMs))
+	}
 
 
 	cmd := exec.Command(gw.opts.FrontendBinary, emulatorArgs...)

@@ -39,6 +39,13 @@ class LockRequest {
   LockRequest(LockMode mode, TableID table_id, const KeyRange& key_range,
               const std::vector<ColumnID>& column_ids);
 
+  // The fields were always populated by the call sites; nothing read them while
+  // the manager held a single database-wide lock.
+  LockMode mode() const { return mode_; }
+  const TableID& table_id() const { return table_id_; }
+  const KeyRange& key_range() const { return key_range_; }
+  const std::vector<ColumnID>& column_ids() const { return column_ids_; }
+
  private:
   // The mode in which we want to acquire the lock.
   LockMode mode_;

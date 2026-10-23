@@ -54,6 +54,18 @@ int abort_current_transaction_probability();
 
 void set_abort_current_transaction_probability(int probability);
 
+// True when the lock manager locks key ranges per table rather than the whole
+// database, so read-write transactions on disjoint keys run concurrently.
+// Off by default.
+bool enable_key_range_locking();
+void set_enable_key_range_locking(bool enabled);
+
+// With key-range locking, how long, in milliseconds, a committing transaction
+// waits for a peer's commit-timestamp reservation to clear before it is
+// aborted. 0 means abort at once. Ignored when key-range locking is off.
+int commit_reservation_wait_ms();
+void set_commit_reservation_wait_ms(int wait_ms);
+
 }  // namespace config
 }  // namespace emulator
 }  // namespace spanner

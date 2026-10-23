@@ -37,6 +37,7 @@ cc_library(
     ],
     deps = [
         "//backend/common:ids",
+        "//backend/datamodel:key",
         "//backend/datamodel:key_range",
         "//common:clock",
         "//common:config",
@@ -60,11 +61,16 @@ cc_test(
     deps = [
         ":manager",
         "//backend/common:ids",
+        "//backend/datamodel:key",
+        "//backend/datamodel:key_range",
+        "//common:config",
+        "@com_google_absl//absl/strings",
         "//tests/common:proto_matchers",
         "@com_github_google_benchmark//:benchmark",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/time",
         "@com_google_googlesql//googlesql/base/testing:status_matchers",
+        "@com_google_googlesql//googlesql/public:value",
         "@com_google_googletest//:gtest_main",
     ],
 )

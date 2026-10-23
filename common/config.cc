@@ -51,6 +51,21 @@ ABSL_FLAG(
     "to the current transaction. A value of zero means that the emulator will "
     "never abort the current transaction.");
 
+ABSL_FLAG(
+    bool, enable_key_range_locking, false,
+    "If true, read-write transactions lock key ranges per table (shared for "
+    "reads, exclusive for writes) instead of the whole database, so "
+    "transactions that touch disjoint keys run concurrently. Conflicting "
+    "transactions are still aborted with ABORTED. If false (the default), only "
+    "one read-write transaction runs at a time.");
+
+ABSL_FLAG(
+    int, commit_reservation_wait_ms, 5000,
+    "With --enable_key_range_locking, how long in milliseconds a committing "
+    "transaction waits for another transaction to finish reserving its commit "
+    "timestamp before it is aborted. 0 aborts at once. Ignored when key-range "
+    "locking is disabled.");
+
 namespace google {
 namespace spanner {
 namespace emulator {
@@ -74,6 +89,22 @@ int abort_current_transaction_probability() {
 
 void set_abort_current_transaction_probability(int probability) {
   absl::SetFlag(&FLAGS_abort_current_transaction_probability, probability);
+}
+
+bool enable_key_range_locking() {
+  return absl::GetFlag(FLAGS_enable_key_range_locking);
+}
+
+void set_enable_key_range_locking(bool enabled) {
+  absl::SetFlag(&FLAGS_enable_key_range_locking, enabled);
+}
+
+int commit_reservation_wait_ms() {
+  return absl::GetFlag(FLAGS_commit_reservation_wait_ms);
+}
+
+void set_commit_reservation_wait_ms(int wait_ms) {
+  absl::SetFlag(&FLAGS_commit_reservation_wait_ms, wait_ms);
 }
 
 }  // namespace config
