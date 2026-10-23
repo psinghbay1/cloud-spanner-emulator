@@ -76,6 +76,10 @@ var (
 		"With --enable_key_range_locking, how long in milliseconds a committing transaction "+
 			"waits for another commit to finish before it is aborted. 0 aborts at once. "+
 			"Negative (the default) keeps the emulator's default of 5000.")
+	enableSqlReadPushdown = flag.Bool("enable_sql_read_pushdown", false,
+		"If true, SQL reads and DML in read-write transactions lock only the key ranges "+
+			"their WHERE clause pins instead of whole tables. Has an effect only with "+
+			"--enable_key_range_locking. Off by default.")
 )
 
 // resolveGRPCBinary figures out the full path to the grpc binary from the --grpc_binary flag.
@@ -177,6 +181,7 @@ func main() {
 		RemoteFunctionsHostPort:                        *remoteFunctionsHostPort,
 		EnableKeyRangeLocking:                          *enableKeyRangeLocking,
 		CommitReservationWaitMs:                        *commitReservationWaitMs,
+		EnableSqlReadPushdown:                          *enableSqlReadPushdown,
 	}
 	gw := gateway.New(gwopts)
 	gw.Run()

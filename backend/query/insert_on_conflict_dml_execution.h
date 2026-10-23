@@ -35,6 +35,7 @@
 #include "absl/status/statusor.h"
 #include "backend/access/read.h"
 #include "backend/datamodel/key.h"
+#include "backend/datamodel/key_set.h"
 #include "backend/query/catalog.h"
 #include "backend/query/function_catalog.h"
 #include "backend/query/query_engine_util.h"
@@ -44,6 +45,10 @@ namespace google {
 namespace spanner {
 namespace emulator {
 namespace backend {
+
+// Conflict target name that stands for the table's primary key rather than a
+// unique index.
+inline constexpr char kReservedIndexNameForPrimaryKey[] = "PRIMARY_KEY";
 
 class InsertOnConflictDoUpdateRewriter
     : public googlesql::ResolvedASTDeepCopyVisitor {
@@ -120,11 +125,12 @@ absl::Status ExtractColumnInfoAndRowsForInsertOrUpdateAction(
     absl::flat_hash_set<int>* insert_column_index_in_mutation_for_insert,
     absl::flat_hash_set<int>* insert_column_index_in_mutation_for_update);
 
-// Returns the original table rows that are present in the table before the
-// INSERT statement was executed.
+// Returns the original table rows within `key_set` that are present in the
+// table before the INSERT statement was executed.
 absl::StatusOr<std::set<Key>> GetOriginalTableRows(
     const Table* table, const std::string& unique_constraint_name,
-    const std::vector<std::string>& key_columns, RowReader* reader);
+    const std::vector<std::string>& key_columns, const KeySet& key_set,
+    RowReader* reader);
 
 // Invoked in the workflow to execute INSERT...ON CONFLICT statement.
 // Builds ResolvedInsertStmt AST for an insert statement to insert rows into the

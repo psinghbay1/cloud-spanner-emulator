@@ -87,6 +87,7 @@ cc_library(
         "singleton_tables.cc",
         "snapshot_reads.cc",
         "spanner_sys.cc",
+        "sql_read_pushdown.cc",
         "tablesample.cc",
         "thread_safety.cc",
         "transaction_errors.cc",

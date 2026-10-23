@@ -66,6 +66,12 @@ void set_enable_key_range_locking(bool enabled);
 int commit_reservation_wait_ms();
 void set_commit_reservation_wait_ms(int wait_ms);
 
+// True when SQL reads and DML scans read only the key ranges their filters
+// pin, so with key-range locking they lock those ranges instead of the whole
+// table. Off by default; without key-range locking it changes nothing.
+bool enable_sql_read_pushdown();
+void set_enable_sql_read_pushdown(bool enabled);
+
 }  // namespace config
 }  // namespace emulator
 }  // namespace spanner

@@ -166,6 +166,9 @@ absl::Status IndexHintValidator::ValidateIndexesForTables() {
         }
       }
     }
+    if (!index->is_search_index() && !index->is_vector_index()) {
+      query_table->RecordForcedIndex(index);
+    }
   }
   return absl::OkStatus();
 }

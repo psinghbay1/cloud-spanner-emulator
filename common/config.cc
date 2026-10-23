@@ -66,6 +66,15 @@ ABSL_FLAG(
     "timestamp before it is aborted. 0 aborts at once. Ignored when key-range "
     "locking is disabled.");
 
+ABSL_FLAG(
+    bool, enable_sql_read_pushdown, false,
+    "If true, a SQL query or DML statement in a read-write transaction reads, "
+    "and so locks, only the primary-key points, prefixes and ranges its WHERE "
+    "clause pins (or the FORCE_INDEX index range and the base rows in it) "
+    "instead of the whole table. Has an effect only with "
+    "--enable_key_range_locking. If false (the default), SQL reads lock every "
+    "table they scan.");
+
 namespace google {
 namespace spanner {
 namespace emulator {
@@ -105,6 +114,14 @@ int commit_reservation_wait_ms() {
 
 void set_commit_reservation_wait_ms(int wait_ms) {
   absl::SetFlag(&FLAGS_commit_reservation_wait_ms, wait_ms);
+}
+
+bool enable_sql_read_pushdown() {
+  return absl::GetFlag(FLAGS_enable_sql_read_pushdown);
+}
+
+void set_enable_sql_read_pushdown(bool enabled) {
+  absl::SetFlag(&FLAGS_enable_sql_read_pushdown, enabled);
 }
 
 }  // namespace config

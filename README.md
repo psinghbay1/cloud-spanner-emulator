@@ -339,6 +339,83 @@ Caveats:
 Defaults: `--enable_key_range_locking=false`,
 `--commit_reservation_wait_ms=5000` (used only when key-range locking is on).
 
+### Fine-grained locks for SQL reads (read pushdown)
+
+Key-range locking narrows the locks of reads and mutations that name their
+keys, but a SQL query or DML statement in a read-write transaction still reads
+every table it scans in full and so share-locks the whole table. Two
+transactions that each `SELECT ... WHERE id = @id` and then update that row
+still conflict, so key-range locking alone does not help SQL-heavy workloads.
+
+`--enable_sql_read_pushdown` makes a table scan read, and so lock, only the
+keys its filters allow. The emulator evaluates the full `WHERE` clause on
+every row it reads, so a narrowed read never changes a result; it only
+changes what is locked. The lock narrows for:
+
+- **Primary-key equality and `IN`**: `pk = value`, `pk IN (v1, v2, ...)` and
+  `pk IN UNNEST(@array)` (a literal or parameter array; `NULL` elements are
+  skipped) on the leading primary-key columns lock those keys as points when
+  every key column is pinned, or as key prefixes when only leading ones are.
+  Combinations are expanded up to 1000 keys; beyond that the scan uses a
+  shorter prefix.
+- **A range on the next key column**: after the pinned prefix (which may be
+  empty), `<`, `<=`, `>`, `>=` or `BETWEEN` on the next primary-key column
+  locks one closed range per prefix, honouring `DESC` key columns. Later key
+  columns are ignored, which can over-lock but never misses a row.
+- **`FORCE_INDEX`**: when the key filters pin nothing and the scan names an
+  index with `@{FORCE_INDEX=...}`, filters on the index's leading key columns
+  (equality, `IN` or a range, as above) lock that index range, and the base
+  rows of the entries in it are read and locked as points. A range holding
+  more than 1000 entries falls back to the whole table.
+- **DML**: `UPDATE` and `DELETE` apply the same rules to the key filters ANDed
+  into their `WHERE`. `INSERT ... VALUES` checks for existing rows only at the
+  keys it inserts. `INSERT ... ON CONFLICT` looks up existing rows only at the
+  inserted conflict-target keys (points for the primary key, prefixes for a
+  unique index) and updates only those rows. Both need every key value to be
+  a non-`NULL` literal or parameter of the column's exact type, and at most
+  1000 rows.
+
+Equality on key columns of type `INT64`, `STRING`, `BYTES`, `BOOL`, `DATE` and
+`TIMESTAMP` is used; other key types (for example `FLOAT64`, `NUMERIC`, `JSON`)
+stop the narrowing at that column.
+
+Everything else locks the whole table, as before: a scan with no usable key
+filter (for example a filter on a non-key column without `FORCE_INDEX`), a
+filter on a key column that is not leading, join keys that are not constants,
+`INSERT ... SELECT`, a DML statement that scans its target table a second
+time, `FORCE_INDEX` naming a search or vector index, and reads of change
+streams and index tables.
+
+Enable it together with key-range locking; on its own it has no effect,
+because the database-wide lock ignores key ranges:
+
+```shell
+./gateway_main --hostname localhost \
+    --enable_key_range_locking --enable_sql_read_pushdown
+```
+
+or with the docker image:
+
+```shell
+docker run -p 9010:9010 -p 9020:9020 gcr.io/cloud-spanner-emulator/emulator \
+    ./gateway_main --hostname 0.0.0.0 \
+    --enable_key_range_locking --enable_sql_read_pushdown
+```
+
+`emulator_main` accepts the same flags when it is run directly.
+
+Caveats:
+
+- Locks are still conservative: when the emulator cannot narrow a scan it
+  locks the whole table, so it can report a conflict Cloud Spanner would not,
+  but never the reverse.
+- A `FORCE_INDEX` read locks the index range it read, so an insert that would
+  add a matching index entry conflicts with it, as in Cloud Spanner.
+- Conflicts are resolved exactly as described for key-range locking above.
+
+Defaults: `--enable_sql_read_pushdown=false`. With the flag off, SQL reads and
+DML run exactly as before.
+
 ## Frequently Asked Questions (FAQ)
 
 #### Which [client library](https://cloud.google.com/spanner/docs/reference/libraries) versions are supported?

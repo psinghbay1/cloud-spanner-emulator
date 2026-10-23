@@ -57,8 +57,6 @@ namespace spanner {
 namespace emulator {
 namespace backend {
 
-constexpr char kReservedIndexNameForPrimaryKey[] = "PRIMARY_KEY";
-
 namespace {
 using InsertRow = std::vector<googlesql::Value>;
 using googlesql::MakeResolvedUpdateItem;
@@ -390,14 +388,15 @@ absl::Status ResolveConflictTarget(
 
 absl::StatusOr<std::set<Key>> GetOriginalTableRows(
     const Table* table, const std::string& unique_constraint_name,
-    const std::vector<std::string>& key_columns, RowReader* reader) {
+    const std::vector<std::string>& key_columns, const KeySet& key_set,
+    RowReader* reader) {
   std::set<Key> original_table_row_keys;
   ReadArg read_arg;
   read_arg.table = table->Name();
   if (unique_constraint_name != kReservedIndexNameForPrimaryKey) {
     read_arg.index = unique_constraint_name;
   }
-  read_arg.key_set = KeySet::All();
+  read_arg.key_set = key_set;
   read_arg.columns = key_columns;
   std::unique_ptr<RowCursor> cursor;
   GOOGLESQL_RETURN_IF_ERROR(reader->Read(read_arg, &cursor));
