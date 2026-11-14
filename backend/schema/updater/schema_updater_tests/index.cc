@@ -23,6 +23,7 @@
 #include "google/spanner/admin/database/v1/common.pb.h"
 #include "googlesql/public/types/array_type.h"
 #include "googlesql/public/types/type_factory.h"
+#include "googlesql/public/value.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "googlesql/base/testing/status_matchers.h"
@@ -31,12 +32,16 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/substitute.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "backend/common/ids.h"
+#include "backend/datamodel/key.h"
 #include "backend/schema/catalog/schema.h"
 #include "backend/schema/catalog/table.h"
 #include "backend/schema/printer/print_ddl.h"
 #include "backend/schema/updater/schema_updater.h"
 #include "backend/schema/updater/schema_updater_tests/base.h"
+#include "backend/storage/in_memory_storage.h"
 #include "common/errors.h"
 #include "third_party/spanner_pg/datatypes/extended/spanner_extended_type.h"
 
@@ -1093,6 +1098,86 @@ TEST_P(SchemaUpdaterTest, DropIndex) {
   // Check that the index data table (and other dependent nodes) are
   // also deleted.
   EXPECT_EQ(new_schema->GetSchemaGraph()->GetSchemaNodes().size(), 4);
+}
+
+TEST_P(SchemaUpdaterTest, DropIndexReclaimsIndexDataInStorage) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto schema, CreateSchema({R"sql(
+      CREATE TABLE T (
+        k1 INT64,
+        c1 INT64
+      ) PRIMARY KEY (k1 ASC)
+    )sql",
+                                                  R"sql(
+      CREATE INDEX Idx ON T(c1)
+    )sql"}));
+  const Index* index = schema->FindIndex("Idx");
+  ASSERT_NE(index, nullptr);
+  const Table* index_data_table = index->index_data_table();
+  const TableID index_data_table_id = index_data_table->id();
+  const ColumnID c1_column_id = index_data_table->FindColumn("c1")->id();
+
+  // Simulate an indexed row in storage before the index is dropped.
+  const Key index_key(
+      {googlesql::values::Int64(10), googlesql::values::Int64(1)});
+  GOOGLESQL_ASSERT_OK(storage_->Write(absl::UnixEpoch(), index_data_table_id,
+                                index_key, {c1_column_id},
+                                {googlesql::values::Int64(10)}));
+
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto new_schema, UpdateSchema(schema.get(), {R"sql(
+      DROP INDEX Idx
+    )sql"}));
+  EXPECT_EQ(new_schema->FindIndex("Idx"), nullptr);
+
+  // Once the retention period has passed, the index data table must be gone
+  // from storage rather than kept alive with no schema referencing it.
+  storage_->CleanUpDeletedTables(absl::InfiniteFuture());
+  EXPECT_THAT(
+      storage_->Lookup(absl::InfiniteFuture(), index_data_table_id, index_key,
+                       /*column_ids=*/{}, /*values=*/nullptr),
+              googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST_P(SchemaUpdaterTest, DropTableAndIndexInOneBatchReclaimsBothInStorage) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto schema, CreateSchema({R"sql(
+      CREATE TABLE A (
+        k1 INT64
+      ) PRIMARY KEY (k1 ASC)
+    )sql",
+                                                  R"sql(
+      CREATE TABLE B (
+        k1 INT64,
+        c1 INT64
+      ) PRIMARY KEY (k1 ASC)
+    )sql",
+                                                  R"sql(
+      CREATE INDEX IdxB ON B(c1)
+    )sql"}));
+  const TableID table_a_id = schema->FindTable("A")->id();
+  const TableID index_data_table_id =
+      schema->FindIndex("IdxB")->index_data_table()->id();
+  const Key table_a_key({googlesql::values::Int64(1)});
+  const Key index_key(
+      {googlesql::values::Int64(10), googlesql::values::Int64(1)});
+  GOOGLESQL_ASSERT_OK(storage_->Write(absl::UnixEpoch(), table_a_id,
+                                table_a_key, /*column_ids=*/{},
+                                /*values=*/{}));
+  GOOGLESQL_ASSERT_OK(storage_->Write(absl::UnixEpoch(), index_data_table_id,
+                                index_key, /*column_ids=*/{}, /*values=*/{}));
+
+  // Both drops share one schema change timestamp.
+  GOOGLESQL_ASSERT_OK(
+      UpdateSchema(schema.get(), {"DROP TABLE A", "DROP INDEX IdxB"})
+          .status());
+
+  storage_->CleanUpDeletedTables(absl::InfiniteFuture());
+  EXPECT_THAT(
+      storage_->Lookup(absl::InfiniteFuture(), table_a_id, table_a_key,
+                       /*column_ids=*/{}, /*values=*/nullptr),
+      googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(
+      storage_->Lookup(absl::InfiniteFuture(), index_data_table_id, index_key,
+                       /*column_ids=*/{}, /*values=*/nullptr),
+      googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
 }
 
 TEST_P(SchemaUpdaterTest, DropIndexIfExists) {

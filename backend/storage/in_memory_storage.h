@@ -17,6 +17,9 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_IN_MEMORY_STORAGE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_IN_MEMORY_STORAGE_H_
 
+#include <map>
+#include <utility>
+
 #include "googlesql/public/value.h"
 #include "absl/time/time.h"
 #include "backend/common/ids.h"
@@ -99,11 +102,14 @@ class InMemoryStorage : public Storage {
   mutable absl::Mutex mu_;
   Tables tables_ ABSL_GUARDED_BY(mu_);
 
-  // Tracks when tables were dropped so that we can clean up the data.
-  std::map<absl::Time, TableID> dropped_tables_ ABSL_GUARDED_BY(mu_);
+  // Tracks when tables were dropped so that we can clean up the data. A single
+  // schema change can drop several tables at the same timestamp, so this must
+  // keep every entry rather than one per timestamp.
+  std::multimap<absl::Time, TableID> dropped_tables_ ABSL_GUARDED_BY(mu_);
 
-  // Tracks when columns were dropped so that we can clean up the data.
-  std::map<absl::Time, std::pair<TableID, ColumnID>> dropped_columns_
+  // Tracks when columns were dropped so that we can clean up the data. Keeps
+  // every entry for the same reason as dropped_tables_.
+  std::multimap<absl::Time, std::pair<TableID, ColumnID>> dropped_columns_
       ABSL_GUARDED_BY(mu_);
 
   mutable absl::Mutex version_retention_period_mu_ ABSL_ACQUIRED_AFTER(mu_);

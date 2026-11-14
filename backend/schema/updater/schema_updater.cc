@@ -6892,6 +6892,13 @@ absl::Status SchemaUpdaterImpl::DropIndex(const ddl::DropIndex& drop_index) {
           return absl::OkStatus();
         }));
   }
+
+  // Index rows live in their own storage table. Mark it dropped so that
+  // CleanUpDeletedTables() can reclaim the data, as DropTable() does for user
+  // tables; otherwise the rows stay in storage for the life of the process.
+  if (index->index_data_table() != nullptr) {
+    dropped_tables_.push_back(index->index_data_table()->id());
+  }
   return DropNode(index);
 }
 
