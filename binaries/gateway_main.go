@@ -68,6 +68,14 @@ var (
 		"If true, the emulator will print all third-party notices to stdout.")
 	remoteFunctionsHostPort = flag.String("remote_functions_host_port", "",
 		"The host:port to use for remote functions.")
+	sessionIdleTimeout = flag.String("session_idle_timeout", "",
+		"If set (e.g. 30m), sessions unused for this long are deleted, so sessions clients "+
+			"abandon are not held forever. If the SESSION_IDLE_TIMEOUT environment variable "+
+			"is set, it overrides this flag. Unset never deletes idle sessions.")
+	operationRetention = flag.String("operation_retention", "",
+		"If set (e.g. 10m), finished long-running operations are deleted this long after "+
+			"they complete. If the OPERATION_RETENTION environment variable is set, it "+
+			"overrides this flag. Unset keeps operations until DeleteOperation is called.")
 )
 
 // resolveGRPCBinary figures out the full path to the grpc binary from the --grpc_binary flag.
@@ -101,7 +109,6 @@ func resolveGRPCBinary() string {
 
 	return retval
 }
-
 
 func main() {
 	flag.Parse()
@@ -151,7 +158,16 @@ func main() {
 			log.Fatal(err)
 		}
 	}
-
+	// If the environment variables are set, they override the
+	// --session_idle_timeout and --operation_retention flags.
+	sessionIdleTimeout := *sessionIdleTimeout
+	if os.Getenv("SESSION_IDLE_TIMEOUT") != "" {
+		sessionIdleTimeout = os.Getenv("SESSION_IDLE_TIMEOUT")
+	}
+	operationRetention := *operationRetention
+	if os.Getenv("OPERATION_RETENTION") != "" {
+		operationRetention = os.Getenv("OPERATION_RETENTION")
+	}
 
 	// Start the gateway http server. This will run the emulator grpc server as a subprocess and
 	// proxy http/json requests into grpc requests.
@@ -167,6 +183,8 @@ func main() {
 		OverrideMaxDatabasesPerInstance:    instanceDbs,
 		OverrideChangeStreamPartitionTokenAliveSeconds: overrideChangeStreamPartitionTokenAliveSeconds,
 		RemoteFunctionsHostPort:                        *remoteFunctionsHostPort,
+		SessionIdleTimeout:                             sessionIdleTimeout,
+		OperationRetention:                             operationRetention,
 	}
 	gw := gateway.New(gwopts)
 	gw.Run()

@@ -23,8 +23,10 @@
 #include "googlesql/base/testing/status_matchers.h"
 #include "tests/common/proto_matchers.h"
 #include "absl/strings/match.h"
+#include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "common/clock.h"
+#include "common/config.h"
 #include "common/errors.h"
 #include "frontend/collections/database_manager.h"
 #include "frontend/entities/database.h"
@@ -42,12 +44,18 @@ class SessionManagerTest : public testing::Test {
       : session_manager_(&clock_), database_manager_(&clock_) {}
 
   void SetUp() override {
+    saved_idle_timeout_ = config::session_idle_timeout();
     GOOGLESQL_ASSERT_OK_AND_ASSIGN(
         database_,
         database_manager_.CreateDatabase(
             "projects/test-p/instances/test-i/databases/test-database", {}));
   }
 
+  void TearDown() override {
+    config::set_session_idle_timeout(saved_idle_timeout_);
+  }
+
+  absl::Duration saved_idle_timeout_;
   Clock clock_;
   Labels test_labels_;
   bool multiplexed_ = false;
@@ -277,6 +285,109 @@ TEST_F(SessionManagerTest, ListSessionsWithSimilarPrefix) {
         actual[i]->session_uri(),
         absl::StrCat(database1->database_uri(), "/sessions/")));
   }
+}
+
+TEST_F(SessionManagerTest, PruneRemovesSessionNotUsedSinceBound) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Session> session,
+      session_manager_.CreateSession(test_labels_, /*multiplexed=*/false,
+                                     database_, /*mux_txn_manager=*/nullptr));
+  const std::string uri = session->session_uri();
+
+  EXPECT_EQ(session_manager_.PruneSessionsNotUsedSince(absl::Now() +
+                                                       absl::Hours(1)),
+            1);
+  EXPECT_THAT(session_manager_.GetSession(uri),
+              googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST_F(SessionManagerTest, PruneKeepsRecentlyUsedSession) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Session> session,
+      session_manager_.CreateSession(test_labels_, /*multiplexed=*/false,
+                                     database_, /*mux_txn_manager=*/nullptr));
+
+  EXPECT_EQ(session_manager_.PruneSessionsNotUsedSince(absl::Now() -
+                                                       absl::Hours(1)),
+            0);
+  GOOGLESQL_EXPECT_OK(session_manager_.GetSession(session->session_uri()));
+}
+
+TEST_F(SessionManagerTest, PruneLeavesMultiplexedSessionsByDefault) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Session> session,
+      session_manager_.CreateSession(test_labels_, /*multiplexed=*/true,
+                                     database_, /*mux_txn_manager=*/nullptr));
+
+  EXPECT_EQ(session_manager_.PruneSessionsNotUsedSince(absl::Now() +
+                                                       absl::Hours(1)),
+            0);
+  GOOGLESQL_EXPECT_OK(session_manager_.GetSession(session->session_uri()));
+  EXPECT_EQ(session_manager_.PruneSessionsNotUsedSince(
+                absl::Now() + absl::Hours(1), /*prune_multiplexed=*/true),
+            1);
+}
+
+TEST_F(SessionManagerTest, PruneRemovesOnlyTheSessionsPastTheBound) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Session> old_session,
+      session_manager_.CreateSession(test_labels_, /*multiplexed=*/false,
+                                     database_, /*mux_txn_manager=*/nullptr));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Session> new_session,
+      session_manager_.CreateSession(test_labels_, /*multiplexed=*/false,
+                                     database_, /*mux_txn_manager=*/nullptr));
+  const absl::Time bound = absl::Now() + absl::Minutes(1);
+  old_session->set_approximate_last_use_time(bound - absl::Minutes(10));
+  new_session->set_approximate_last_use_time(bound + absl::Minutes(10));
+
+  EXPECT_EQ(session_manager_.PruneSessionsNotUsedSince(bound), 1);
+  EXPECT_THAT(session_manager_.GetSession(old_session->session_uri()),
+              googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
+  GOOGLESQL_EXPECT_OK(session_manager_.GetSession(new_session->session_uri()));
+}
+
+TEST_F(SessionManagerTest, CreateSessionSweepsIdleSessionsWhenTimeoutIsSet) {
+  config::set_session_idle_timeout(absl::Milliseconds(1));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Session> idle,
+      session_manager_.CreateSession(test_labels_, /*multiplexed=*/false,
+                                     database_, /*mux_txn_manager=*/nullptr));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Session> multiplexed,
+      session_manager_.CreateSession(test_labels_, /*multiplexed=*/true,
+                                     database_, /*mux_txn_manager=*/nullptr));
+  idle->set_approximate_last_use_time(absl::Now() - absl::Minutes(10));
+  multiplexed->set_approximate_last_use_time(absl::Now() - absl::Minutes(10));
+  absl::SleepFor(absl::Milliseconds(5));
+
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Session> fresh,
+      session_manager_.CreateSession(test_labels_, /*multiplexed=*/false,
+                                     database_, /*mux_txn_manager=*/nullptr));
+
+  EXPECT_THAT(session_manager_.GetSession(idle->session_uri()),
+              googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
+  GOOGLESQL_EXPECT_OK(session_manager_.GetSession(multiplexed->session_uri()));
+  GOOGLESQL_EXPECT_OK(session_manager_.GetSession(fresh->session_uri()));
+}
+
+TEST_F(SessionManagerTest, CreateSessionNeverSweepsWhenTimeoutIsUnset) {
+  ASSERT_EQ(config::session_idle_timeout(), absl::InfiniteDuration());
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Session> idle,
+      session_manager_.CreateSession(test_labels_, /*multiplexed=*/false,
+                                     database_, /*mux_txn_manager=*/nullptr));
+  // Idle well past the timeout used above, but still inside upstream's
+  // one-hour lazy expiry, so it remains reachable.
+  idle->set_approximate_last_use_time(absl::Now() - absl::Minutes(10));
+  absl::SleepFor(absl::Milliseconds(5));
+
+  GOOGLESQL_ASSERT_OK(
+      session_manager_.CreateSession(test_labels_, /*multiplexed=*/false,
+                                     database_, /*mux_txn_manager=*/nullptr));
+
+  GOOGLESQL_EXPECT_OK(session_manager_.GetSession(idle->session_uri()));
 }
 
 }  // namespace frontend

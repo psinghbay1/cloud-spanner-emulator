@@ -16,6 +16,8 @@
 
 #include "frontend/collections/session_manager.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
@@ -27,6 +29,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
+#include "common/config.h"
 #include "common/errors.h"
 #include "frontend/collections/multiplexed_session_transaction_manager.h"
 #include "frontend/common/labels.h"
@@ -39,11 +42,19 @@ namespace spanner {
 namespace emulator {
 namespace frontend {
 
+namespace {
+
+// Upper bound on how often session creation walks the whole session map.
+constexpr absl::Duration kMaxIdleSweepInterval = absl::Minutes(1);
+
+}  // namespace
+
 absl::StatusOr<std::shared_ptr<Session>> SessionManager::CreateSession(
     const Labels& labels, const bool multiplexed,
     std::shared_ptr<Database> database,
     MultiplexedSessionTransactionManager* mux_txn_manager) {
   absl::MutexLock lock(mu_);
+  MaybeSweepIdleSessions();
   const std::string session_id = absl::StrCat(next_session_id_++);
   std::string session_uri =
       MakeSessionUri(database->database_uri(), session_id);
@@ -106,6 +117,41 @@ SessionManager::ListSessions(const std::string& database_uri,
     }
   }
   return sessions;
+}
+
+void SessionManager::MaybeSweepIdleSessions() {
+  const absl::Duration idle_timeout = config::session_idle_timeout();
+  if (idle_timeout == absl::InfiniteDuration()) return;
+  const absl::Time now = clock_->Now();
+  if (now - last_idle_sweep_time_ <
+      std::min(idle_timeout, kMaxIdleSweepInterval)) {
+    return;
+  }
+  last_idle_sweep_time_ = now;
+  PruneSessionsNotUsedSinceLocked(now - idle_timeout,
+                                  /*prune_multiplexed=*/false);
+}
+
+int64_t SessionManager::PruneSessionsNotUsedSince(absl::Time not_used_since,
+                                                  bool prune_multiplexed) {
+  absl::MutexLock lock(mu_);
+  return PruneSessionsNotUsedSinceLocked(not_used_since, prune_multiplexed);
+}
+
+int64_t SessionManager::PruneSessionsNotUsedSinceLocked(
+    absl::Time not_used_since, bool prune_multiplexed) {
+  int64_t pruned = 0;
+  for (auto itr = session_map_.begin(); itr != session_map_.end();) {
+    const std::shared_ptr<Session>& session = itr->second;
+    if ((session->multiplexed() && !prune_multiplexed) ||
+        session->approximate_last_use_time() >= not_used_since) {
+      ++itr;
+      continue;
+    }
+    itr = session_map_.erase(itr);
+    ++pruned;
+  }
+  return pruned;
 }
 
 absl::Status SessionManager::DeleteSession(const std::string& session_uri,

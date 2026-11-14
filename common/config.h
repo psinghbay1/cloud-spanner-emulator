@@ -19,6 +19,8 @@
 
 #include <string>
 
+#include "absl/time/time.h"
+
 namespace google {
 namespace spanner {
 namespace emulator {
@@ -53,6 +55,20 @@ bool disable_query_null_filtered_index_check();
 int abort_current_transaction_probability();
 
 void set_abort_current_transaction_probability(int probability);
+
+// How long a regular session may go unused before the session manager erases
+// it. InfiniteDuration (the default) never sweeps, matching the lazy expiry
+// GetSession() applies on lookup.
+absl::Duration session_idle_timeout();
+
+void set_session_idle_timeout(absl::Duration timeout);
+
+// How long a finished long-running operation is kept before the operation
+// manager erases it. InfiniteDuration (the default) keeps it until a client
+// calls DeleteOperation.
+absl::Duration operation_retention();
+
+void set_operation_retention(absl::Duration retention);
 
 }  // namespace config
 }  // namespace emulator

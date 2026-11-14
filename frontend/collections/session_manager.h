@@ -23,6 +23,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "common/clock.h"
 #include "frontend/collections/multiplexed_session_transaction_manager.h"
 #include "frontend/common/labels.h"
@@ -63,7 +64,27 @@ class SessionManager {
   bool IsMultiplexedSession(const std::string& session_uri) const
       ABSL_LOCKS_EXCLUDED(mu_);
 
+  // Erases sessions not used since `not_used_since`, returning how many were
+  // removed. Multiplexed sessions are left alone unless `prune_multiplexed`:
+  // they expire after 28 days, not an hour, and a client keeps using one.
+  //
+  // Expiry is otherwise lazy: GetSession() erases an expired session only when
+  // it is looked up again, and ListSessions() filters expired sessions out of
+  // its response while leaving them in the map, so an abandoned session and its
+  // transactions stay in memory for the life of the process.
+  int64_t PruneSessionsNotUsedSince(absl::Time not_used_since,
+                                    bool prune_multiplexed = false)
+      ABSL_LOCKS_EXCLUDED(mu_);
+
  private:
+  // Sweeps idle sessions when --session_idle_timeout is set, at most once per
+  // sweep interval so session creation stays cheap.
+  void MaybeSweepIdleSessions() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  int64_t PruneSessionsNotUsedSinceLocked(absl::Time not_used_since,
+                                          bool prune_multiplexed)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
   // System-wide clock.
   Clock* clock_;
 
@@ -72,6 +93,10 @@ class SessionManager {
 
   // Counter for session ids.
   int next_session_id_ ABSL_GUARDED_BY(mu_) = 0;
+
+  // When MaybeSweepIdleSessions() last walked the map.
+  absl::Time last_idle_sweep_time_ ABSL_GUARDED_BY(mu_) =
+      absl::InfinitePast();
 
   // Map from session URI to session objects.
   std::map<std::string, std::shared_ptr<Session>> session_map_

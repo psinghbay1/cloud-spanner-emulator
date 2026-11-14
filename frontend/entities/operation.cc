@@ -20,6 +20,9 @@
 
 #include "google/rpc/status.pb.h"
 #include "absl/strings/str_cat.h"
+#include "absl/synchronization/mutex.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "frontend/common/protos.h"
 
 namespace google {
@@ -40,6 +43,7 @@ void Operation::SetError(const absl::Status& status) {
   absl::MutexLock lock(mu_);
   status_ = status;
   response_.reset();
+  MarkDone();
 }
 
 void Operation::SetResponse(const google::protobuf::Message& response) {
@@ -47,6 +51,21 @@ void Operation::SetResponse(const google::protobuf::Message& response) {
   response_.reset(response.New());
   response_->CopyFrom(response);
   status_ = absl::OkStatus();
+  MarkDone();
+}
+
+void Operation::MarkDone() {
+  if (done_time_ == absl::InfiniteFuture()) done_time_ = absl::Now();
+}
+
+bool Operation::done() const {
+  absl::MutexLock lock(mu_);
+  return response_ != nullptr || !status_.ok();
+}
+
+absl::Time Operation::done_time() const {
+  absl::MutexLock lock(mu_);
+  return done_time_;
 }
 
 void Operation::ToProto(google::longrunning::Operation* operation_pb) {

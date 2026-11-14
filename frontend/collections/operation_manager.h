@@ -17,6 +17,7 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_FRONTEND_COLLECTIONS_OPERATION_MANAGER_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_FRONTEND_COLLECTIONS_OPERATION_MANAGER_H_
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
@@ -26,6 +27,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "frontend/entities/operation.h"
 #include "absl/status/status.h"
 
@@ -94,7 +96,20 @@ class OperationManager {
   absl::StatusOr<std::vector<std::shared_ptr<Operation>>> ListOperations(
       const std::string& resource_uri) ABSL_LOCKS_EXCLUDED(mu_);
 
+  // Erases operations that became done before `done_before`, returning how
+  // many were removed. In-flight operations are left alone.
+  //
+  // An operation is created for every CreateDatabase and UpdateDdl and is
+  // otherwise removed only by an explicit DeleteOperation, which clients rarely
+  // issue. Pruning a done operation makes a later GetOperation report
+  // NOT_FOUND, exactly as DeleteOperation would.
+  int64_t PruneOperationsDoneBefore(absl::Time done_before)
+      ABSL_LOCKS_EXCLUDED(mu_);
+
  private:
+  int64_t PruneOperationsDoneBeforeLocked(absl::Time done_before)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
   // Mutex to guard state below.
   absl::Mutex mu_;
 
