@@ -38,8 +38,8 @@ import (
 	instancepb "cloud.google.com/go/spanner/admin/instance/apiv1/instancepb"
 	lrgw "cloud_spanner_emulator/gateway/longrunning_operations_gateway"
 	dagw "cloud_spanner_emulator/gateway/spanner_admin_database_gateway"
-	spgw "cloud_spanner_emulator/gateway/spanner_gateway"
 	iagw "cloud_spanner_emulator/gateway/spanner_admin_instance_gateway"
+	spgw "cloud_spanner_emulator/gateway/spanner_gateway"
 )
 
 // Options encapsulates options for the emulator gateway.
@@ -55,6 +55,8 @@ type Options struct {
 	OverrideMaxDatabasesPerInstance                int
 	OverrideChangeStreamPartitionTokenAliveSeconds int
 	RemoteFunctionsHostPort                        string
+	// Forwarded to emulator_main as --storage_purge_interval when set.
+	StoragePurgeInterval string
 }
 
 // Gateway implements the emulator gateway server.
@@ -67,9 +69,8 @@ func New(opts Options) *Gateway {
 	return &Gateway{opts}
 }
 
-// Run starts the emulator gateway server.
-func (gw *Gateway) Run() {
-	// Start the emulator grpc server and redirect its output.
+// emulatorArgs builds the emulator_main command line from the options.
+func (gw *Gateway) emulatorArgs() []string {
 	emulatorArgs := []string{
 		"--host_port", gw.opts.FrontendAddress,
 	}
@@ -95,9 +96,17 @@ func (gw *Gateway) Run() {
 	emulatorArgs = append(emulatorArgs,
 		fmt.Sprintf("--override_change_stream_partition_token_alive_seconds=%d",
 			gw.opts.OverrideChangeStreamPartitionTokenAliveSeconds))
+	if gw.opts.StoragePurgeInterval != "" {
+		emulatorArgs = append(emulatorArgs,
+			"--storage_purge_interval="+gw.opts.StoragePurgeInterval)
+	}
+	return emulatorArgs
+}
 
-
-	cmd := exec.Command(gw.opts.FrontendBinary, emulatorArgs...)
+// Run starts the emulator gateway server.
+func (gw *Gateway) Run() {
+	// Start the emulator grpc server and redirect its output.
+	cmd := exec.Command(gw.opts.FrontendBinary, gw.emulatorArgs()...)
 
 	// Proxy emulator log to gateway log.
 	if gw.opts.CopyEmulatorStdout {
@@ -132,7 +141,6 @@ func (gw *Gateway) Run() {
 		log.Println("Shutting down gateway server since grpc server is terminated.")
 		os.Exit(cmd.ProcessState.ExitCode())
 	}()
-
 
 	// Wait for the grpc server to be up.
 	ctx := context.Background()
@@ -171,7 +179,6 @@ func (gw *Gateway) Run() {
 		log.Fatal(err)
 	}
 }
-
 
 func waitForReady(ctx context.Context, endpoint string) error {
 	timeout := 30 * time.Second

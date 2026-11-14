@@ -117,6 +117,58 @@ The first port is the gRPC port and the second port is the REST port.
 
 Works on x86 and arm64 architectures.
 
+## Optional features
+
+These features are disabled by default. Without their flags the emulator
+behaves exactly as described elsewhere in this document.
+
+### Periodic storage purge
+
+**Problem.** The emulator keeps every committed version of every cell in
+memory. A delete only appends a deletion marker, so the row key and its old
+values stay in memory, and a superseded version is only trimmed when its cell
+is written again. A long-lived emulator therefore grows for as long as it runs,
+even when the application deletes the data it no longer needs.
+
+**What it does.** With `--storage_purge_interval` set to a positive duration,
+every database runs a background sweep at that interval which:
+
+* erases rows whose deletion is older than the database's
+  `version_retention_period` (default one hour), including the row key;
+* erases superseded versions older than the retention period, keeping the
+  newest version at or before it so reads inside the window still resolve;
+* reclaims storage of dropped tables and columns, which otherwise happens only
+  on the next schema change;
+* on glibc, calls `malloc_trim(0)` so freed memory is returned to the OS.
+
+**How to enable.** Pass the flag to `gateway_main`, or set the
+`STORAGE_PURGE_INTERVAL` environment variable, which overrides the flag:
+
+```shell
+./gateway_main --storage_purge_interval=10m
+
+docker run -p 9010:9010 -p 9020:9020 -e STORAGE_PURGE_INTERVAL=10m \
+    gcr.io/cloud-spanner-emulator/emulator
+
+docker run -p 9010:9010 -p 9020:9020 gcr.io/cloud-spanner-emulator/emulator \
+    ./gateway_main --hostname 0.0.0.0 --storage_purge_interval=10m
+```
+
+`emulator_main` accepts the same `--storage_purge_interval` flag directly. The
+value uses Go/Abseil duration syntax, e.g. `30s`, `10m`, `1h`.
+
+**Caveats.**
+
+* Only data older than `version_retention_period` is purged. Stale reads at
+  any timestamp inside the retention window return the same results as
+  before.
+* Memory is therefore released no sooner than one retention period after the
+  delete or overwrite.
+* A sweep holds the database's storage lock while it walks the data, so reads
+  and commits on that database wait for it. Prefer an interval of minutes, not
+  seconds, for large databases.
+* The default, unset or `0s`, disables the sweep.
+
 ## Technical Details
 
 The Cloud Spanner Emulator is built using the [GoogleSQL](https://github.com/google/googlesql)

@@ -19,6 +19,8 @@
 
 #include <string>
 
+#include "absl/time/time.h"
+
 namespace google {
 namespace spanner {
 namespace emulator {
@@ -53,6 +55,13 @@ bool disable_query_null_filtered_index_check();
 int abort_current_transaction_probability();
 
 void set_abort_current_transaction_probability(int probability);
+
+// Interval of the background sweep that erases deleted rows and superseded
+// versions older than the version retention period. A non-positive or infinite
+// value disables the sweep, which is the default.
+absl::Duration storage_purge_interval();
+
+void set_storage_purge_interval(absl::Duration interval);
 
 }  // namespace config
 }  // namespace emulator
