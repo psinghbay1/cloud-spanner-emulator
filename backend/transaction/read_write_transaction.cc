@@ -356,7 +356,10 @@ absl::Status ReadWriteTransaction::GuardedCall(
           "Invalid call to Committed transaction. Transaction: ", id()));
     case State::kAborted: {
       if (op != OpType::kRollback) {
-        return error::WoundedTransaction(id_);
+        // The whole-database lock keeps upstream's message; under key-range
+        // locking only an overlapping range can preempt this transaction.
+        return error::WoundedTransaction(
+            id_, config::enable_key_range_locking() ? "random preemption" : "");
       }
       break;
     }

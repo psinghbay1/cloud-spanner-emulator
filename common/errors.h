@@ -143,9 +143,21 @@ absl::Status MutationTableRequired();
 // Transaction errors.
 absl::Status AbortConcurrentTransaction(int64_t requestor_id,
                                         int64_t holder_id);
+// An empty `rule` keeps the whole-database lock's message; key-range locking
+// names the rule that preempted the holder.
 absl::Status AbortCurrentTransaction(backend::TransactionID holder_id,
-                                     backend::TransactionID requestor_id);
-absl::Status WoundedTransaction(backend::TransactionID id);
+                                     backend::TransactionID requestor_id,
+                                     absl::string_view rule = "");
+// A genuine key-range conflict under --enable_key_range_locking. Distinct from
+// AbortConcurrentTransaction so a failure can tell overlapping ranges from the
+// whole-database lock.
+absl::Status AbortConflictingKeyRange(int64_t requestor_id, int64_t holder_id,
+                                      absl::string_view table_id,
+                                      absl::string_view key_range,
+                                      absl::string_view rule =
+                                          "random preemption");
+absl::Status WoundedTransaction(backend::TransactionID id,
+                                absl::string_view rule = "");
 absl::Status CouldNotObtainLockHandleMutex(backend::TransactionID id);
 absl::Status CouldNotObtainTransactionMutex(backend::TransactionID id);
 absl::Status TransactionNotFound(backend::TransactionID id);

@@ -68,6 +68,14 @@ var (
 		"If true, the emulator will print all third-party notices to stdout.")
 	remoteFunctionsHostPort = flag.String("remote_functions_host_port", "",
 		"The host:port to use for remote functions.")
+	enableKeyRangeLocking = flag.Bool("enable_key_range_locking", false,
+		"If true, read-write transactions lock key ranges per table instead of the whole "+
+			"database, so transactions on disjoint keys run concurrently. Conflicting "+
+			"transactions are still aborted. Off by default: one read-write transaction at a time.")
+	commitReservationWaitMs = flag.Int("commit_reservation_wait_ms", -1,
+		"With --enable_key_range_locking, how long in milliseconds a committing transaction "+
+			"waits for another commit to finish before it is aborted. 0 aborts at once. "+
+			"Negative (the default) keeps the emulator's default of 5000.")
 )
 
 // resolveGRPCBinary figures out the full path to the grpc binary from the --grpc_binary flag.
@@ -167,6 +175,8 @@ func main() {
 		OverrideMaxDatabasesPerInstance:    instanceDbs,
 		OverrideChangeStreamPartitionTokenAliveSeconds: overrideChangeStreamPartitionTokenAliveSeconds,
 		RemoteFunctionsHostPort:                        *remoteFunctionsHostPort,
+		EnableKeyRangeLocking:                          *enableKeyRangeLocking,
+		CommitReservationWaitMs:                        *commitReservationWaitMs,
 	}
 	gw := gateway.New(gwopts)
 	gw.Run()

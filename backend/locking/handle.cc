@@ -38,6 +38,11 @@ LockHandle::LockHandle(LockManager* manager, TransactionID tid,
       priority_(priority) {}
 
 LockHandle::~LockHandle() {
+  // Drop any ranges still held. The manager stores a raw LockHandle* per range,
+  // so a handle destroyed without UnlockAll would leave a dangling pointer that
+  // FindConflict dereferences. Callers are expected to call UnlockAll, but the
+  // destructor must not depend on it.
+  manager_->UnlockAll(this);
   absl::MutexLock lock(mu_);
   try_abort_transaction_fn_ = nullptr;
 }

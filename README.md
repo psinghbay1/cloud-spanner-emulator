@@ -197,7 +197,9 @@ Notable limitations:
   time. Any concurrent transaction will be aborted. Transactions should always
   be wrapped in a retry loop. This [recommendation](
   https://cloud.google.com/spanner/docs/transactions) applies to the Cloud
-  Spanner service as well.
+  Spanner service as well. See
+  [Concurrent read-write transactions](#concurrent-read-write-transactions-key-range-locking)
+  for an opt-in that lifts this for transactions on disjoint keys.
 
 - The emulator does not support persistence - all data is kept in memory and
   discarded when the emulator terminates.
@@ -270,6 +272,72 @@ Notable limitations:
   - `RECEIVE_<queue>` enforces `max_batch_size` as a row limit per scan rather
     than server-side batching, and takes the `priority` parameter and
     per-placement TVFs (`RECEIVE_<queue>_PLACEMENT_<placement>`) as no-ops.
+
+## Optional features
+
+These features are off by default. With every flag unset the emulator behaves
+exactly as described in the rest of this document.
+
+### Concurrent read-write transactions (key-range locking)
+
+By default the emulator allows only one read-write transaction at a time (see
+[Features and Limitations](#features-and-limitations)): a second transaction
+is aborted even when it touches completely unrelated rows. Test suites that run
+in parallel against one emulator database therefore see frequent `ABORTED`
+errors that production Cloud Spanner would not produce.
+
+`--enable_key_range_locking` replaces the single database-wide lock with locks
+on key ranges:
+
+- Every lock names a **table** and a **key range** in that table, taken from
+  the key set of the read or the mutation: a point read or write locks a
+  single key and a key-range read locks that range. A SQL query locks every
+  table it scans in full.
+- Reads take **shared** locks and writes take **exclusive** locks.
+- Two transactions conflict only when they lock the same table, their ranges
+  overlap, and at least one of the two locks is exclusive. Readers of the same
+  rows never conflict with each other.
+- A schema change still takes a database-wide lock and conflicts with every
+  read-write transaction.
+- Commit timestamps are still assigned one commit at a time, so reads at a
+  timestamp keep their meaning. A transaction that reaches commit while
+  another is committing waits up to `--commit_reservation_wait_ms`
+  milliseconds (default `5000`) for it to finish, and is aborted after that.
+  `0` aborts it at once. This flag has no effect unless key-range locking is
+  enabled.
+
+Enable it with the gateway:
+
+```shell
+./gateway_main --hostname localhost --enable_key_range_locking
+# Optionally tune the commit wait:
+./gateway_main --hostname localhost --enable_key_range_locking \
+    --commit_reservation_wait_ms=1000
+```
+
+or with the docker image, by overriding its command:
+
+```shell
+docker run -p 9010:9010 -p 9020:9020 gcr.io/cloud-spanner-emulator/emulator \
+    ./gateway_main --hostname 0.0.0.0 --enable_key_range_locking
+```
+
+`emulator_main` accepts the same two flags when it is run directly.
+
+Caveats:
+
+- Conflicting transactions are still aborted with `ABORTED`, as before; a
+  conflicting request never waits for the lock. Clients must keep retrying
+  aborted transactions, as they must against Cloud Spanner.
+- When two transactions conflict, the holder is aborted with probability
+  `--abort_current_transaction_probability` and otherwise the requester is
+  aborted -- the same rule the database-wide lock uses. This is not Cloud
+  Spanner's wound-wait ordering.
+- Locking is conservative: a range the emulator cannot narrow is locked whole,
+  so it can report a conflict Cloud Spanner would not, but never the reverse.
+
+Defaults: `--enable_key_range_locking=false`,
+`--commit_reservation_wait_ms=5000` (used only when key-range locking is on).
 
 ## Frequently Asked Questions (FAQ)
 

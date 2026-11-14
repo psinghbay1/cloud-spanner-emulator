@@ -83,9 +83,11 @@ class LockHandle {
   // Returns true if this handle is waiting on any lock requests to complete.
   bool IsBlocked() ABSL_LOCKS_EXCLUDED(mu_);
 
-  // Returns true if this handle has been aborted by the lock manager. Previous
-  // locks acquired by the handle are not release automatically. The handle must
-  // explicitly call UnlockAll().
+  // Returns true if this handle has been aborted by the lock manager. When the
+  // manager aborts a holder to make room for another request it releases that
+  // holder's ranges itself; a handle aborted as the requester holds nothing new.
+  // Either way the owner still calls UnlockAll() (or lets the destructor do it)
+  // to reset the handle.
   bool IsAborted() ABSL_LOCKS_EXCLUDED(mu_);
 
   // Waits till all locks requested via this handle have either all been granted
