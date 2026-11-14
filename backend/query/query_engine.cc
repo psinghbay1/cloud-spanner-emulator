@@ -65,6 +65,7 @@
 #include "backend/access/write.h"
 #include "backend/common/case.h"
 #include "backend/datamodel/key.h"
+#include "backend/datamodel/key_range.h"
 #include "backend/datamodel/key_set.h"
 #include "backend/datamodel/value.h"
 #include "backend/query/analyzer_options.h"
@@ -667,6 +668,315 @@ absl::StatusOr<CaseInsensitiveStringSet> ColumnsInUpdate(
   return columns;
 }
 
+// The value of a literal or named parameter, or nullopt for anything else.
+std::optional<googlesql::Value> ConstantValue(
+    const googlesql::ResolvedExpr* expr,
+    const googlesql::ParameterValueMap& parameters) {
+  if (expr->Is<googlesql::ResolvedLiteral>()) {
+    return expr->GetAs<googlesql::ResolvedLiteral>()->value();
+  }
+  if (!expr->Is<googlesql::ResolvedParameter>()) {
+    return std::nullopt;
+  }
+  const std::string& name = expr->GetAs<googlesql::ResolvedParameter>()->name();
+  for (const auto& [parameter_name, value] : parameters) {
+    if (absl::EqualsIgnoreCase(parameter_name, name)) {
+      return value;
+    }
+  }
+  return std::nullopt;
+}
+
+// Above this many inserted rows an INSERT reads the whole table, and
+// INSERT ... ON CONFLICT reads the whole conflict target.
+constexpr int kMaxOnConflictLookupKeys = 1000;
+
+// Above this many array elements an IN UNNEST keeps the whole-table read.
+constexpr int kMaxDmlInArrayValues = 1000;
+
+// Adds an IN list filter for `column IN UNNEST(<literal or parameter array>)`.
+// NULL elements never match, so they are dropped; the key builder rejects
+// elements whose type is not exactly the column's.
+void CollectInArrayFilter(
+    const std::vector<std::unique_ptr<const googlesql::ResolvedExpr>>&
+        arguments,
+    const absl::flat_hash_map<int, int>& table_index_by_column_id,
+    const googlesql::ParameterValueMap& parameters,
+    absl::flat_hash_map<int, googlesql::ColumnFilter>* filters) {
+  if (arguments.size() != 2 ||
+      !arguments[0]->Is<googlesql::ResolvedColumnRef>()) {
+    return;
+  }
+  const int column_id =
+      arguments[0]->GetAs<googlesql::ResolvedColumnRef>()->column().column_id();
+  auto table_index = table_index_by_column_id.find(column_id);
+  if (table_index == table_index_by_column_id.end() ||
+      filters->contains(table_index->second)) {
+    return;
+  }
+  std::optional<googlesql::Value> array =
+      ConstantValue(arguments[1].get(), parameters);
+  if (!array.has_value() || !array->is_valid() || array->is_null() ||
+      !array->type()->IsArray() ||
+      array->num_elements() > kMaxDmlInArrayValues) {
+    return;
+  }
+  std::vector<googlesql::Value> values;
+  for (const googlesql::Value& element : array->elements()) {
+    if (element.is_valid() && !element.is_null()) {
+      values.push_back(element);
+    }
+  }
+  if (values.empty()) {
+    return;
+  }
+  filters->emplace(table_index->second, googlesql::ColumnFilter(values));
+}
+
+// Collects a ColumnFilter for each `column = constant`, `column IN (...)`,
+// `column IN UNNEST(array)` and
+// range comparison ANDed into a DML WHERE, keyed by table column index. Only
+// the first filter on a column is kept: a superset of rows is still correct
+// because the evaluator re-applies the full WHERE.
+void CollectDmlKeyFilters(
+    const googlesql::ResolvedExpr* expr,
+    const absl::flat_hash_map<int, int>& table_index_by_column_id,
+    const googlesql::ParameterValueMap& parameters,
+    absl::flat_hash_map<int, googlesql::ColumnFilter>* filters) {
+  if (expr == nullptr || !expr->Is<googlesql::ResolvedFunctionCall>()) {
+    return;
+  }
+  const auto* call = expr->GetAs<googlesql::ResolvedFunctionCall>();
+  const std::string& function = call->function()->Name();
+  const auto& arguments = call->argument_list();
+  if (function == "$and") {
+    for (const auto& argument : arguments) {
+      CollectDmlKeyFilters(argument.get(), table_index_by_column_id,
+                           parameters, filters);
+    }
+    return;
+  }
+  if (function == "$in_array") {
+    CollectInArrayFilter(arguments, table_index_by_column_id, parameters,
+                         filters);
+    return;
+  }
+  if (arguments.size() < 2) {
+    return;
+  }
+  const googlesql::ResolvedExpr* column_side = arguments[0].get();
+  const googlesql::ResolvedExpr* constant_side = arguments[1].get();
+  std::string comparison = function;
+  if (arguments.size() == 2 &&
+      !column_side->Is<googlesql::ResolvedColumnRef>()) {
+    std::swap(column_side, constant_side);
+    if (comparison == "$less") comparison = "$greater";
+    else if (comparison == "$less_or_equal") comparison = "$greater_or_equal";
+    else if (comparison == "$greater") comparison = "$less";
+    else if (comparison == "$greater_or_equal") comparison = "$less_or_equal";
+  }
+  if (!column_side->Is<googlesql::ResolvedColumnRef>()) {
+    return;
+  }
+  auto table_index = table_index_by_column_id.find(
+      column_side->GetAs<googlesql::ResolvedColumnRef>()->column().column_id());
+  if (table_index == table_index_by_column_id.end() ||
+      filters->contains(table_index->second)) {
+    return;
+  }
+  std::vector<googlesql::Value> values;
+  for (const auto& argument : arguments) {
+    if (argument.get() == column_side) {
+      continue;
+    }
+    std::optional<googlesql::Value> value =
+        ConstantValue(argument.get(), parameters);
+    // NULL never matches, so it cannot form a key; skip the filter instead.
+    if (!value.has_value() || !value->is_valid() || value->is_null()) {
+      return;
+    }
+    if (comparison == "$in_array") {
+      // A NULL element is skipped: it matches no row.
+      if (!value->type()->IsArray()) {
+        return;
+      }
+      for (const googlesql::Value& element : value->elements()) {
+        if (!element.is_null()) {
+          values.push_back(element);
+        }
+      }
+      continue;
+    }
+    values.push_back(*std::move(value));
+  }
+  const googlesql::Value unbounded;
+  if ((comparison == "$equal" && values.size() == 1) || comparison == "$in" ||
+      (comparison == "$in_array" && !values.empty())) {
+    filters->emplace(table_index->second, googlesql::ColumnFilter(values));
+  } else if (comparison == "$between" && values.size() == 2) {
+    filters->emplace(table_index->second,
+                     googlesql::ColumnFilter(values[0], values[1]));
+  } else if ((comparison == "$greater" || comparison == "$greater_or_equal") &&
+             values.size() == 1) {
+    filters->emplace(table_index->second,
+                     googlesql::ColumnFilter(values[0], unbounded));
+  } else if ((comparison == "$less" || comparison == "$less_or_equal") &&
+             values.size() == 1) {
+    filters->emplace(table_index->second,
+                     googlesql::ColumnFilter(unbounded, values[0]));
+  }
+}
+
+// True when the statement scans the target table anywhere besides its own
+// target scan; the filters live on the table, so such a scan would see them.
+bool ScansTargetTableElsewhere(const googlesql::ResolvedNode* statement,
+                               const googlesql::ResolvedTableScan* table_scan) {
+  std::vector<const googlesql::ResolvedNode*> scans;
+  statement->GetDescendantsWithKinds({googlesql::RESOLVED_TABLE_SCAN}, &scans);
+  for (const googlesql::ResolvedNode* node : scans) {
+    const auto* scan = node->GetAs<googlesql::ResolvedTableScan>();
+    if (scan != table_scan && scan->table() == table_scan->table()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Narrows the read (and so the lock) of a table scan to the keys its filter
+// pins, and lifts the restriction when it goes out of scope. Skipped when the
+// statement scans the same table elsewhere, since the filters are per table.
+class ScopedDmlKeyFilters {
+ public:
+  ScopedDmlKeyFilters(const googlesql::ResolvedNode* statement,
+                      const googlesql::ResolvedTableScan* table_scan,
+                      const googlesql::ResolvedExpr* where_expr,
+                      const googlesql::ParameterValueMap& parameters) {
+    if (table_scan == nullptr || where_expr == nullptr ||
+        !config::enable_sql_read_pushdown() ||
+        ScansTargetTableElsewhere(statement, table_scan)) {
+      return;
+    }
+    table_ = dynamic_cast<const QueryableTable*>(table_scan->table());
+    if (table_ == nullptr) {
+      return;
+    }
+    absl::flat_hash_map<int, int> table_index_by_column_id;
+    for (int i = 0; i < table_scan->column_list_size(); ++i) {
+      table_index_by_column_id[table_scan->column_list(i).column_id()] =
+          table_scan->column_index_list(i);
+    }
+    absl::flat_hash_map<int, googlesql::ColumnFilter> filters;
+    CollectDmlKeyFilters(where_expr, table_index_by_column_id, parameters,
+                         &filters);
+    // With nothing pinned, keep any filters an enclosing scope set.
+    if (filters.empty()) {
+      table_ = nullptr;
+      return;
+    }
+    table_->SetDmlKeyFilters(std::move(filters));
+  }
+  // Pins each primary key column of the scanned table to the values `keys`
+  // hold in that position. The cross product is a superset of `keys`, which
+  // is safe because the evaluator re-applies the full WHERE.
+  ScopedDmlKeyFilters(const googlesql::ResolvedTableScan* table_scan,
+                      const std::vector<Key>& keys) {
+    if (table_scan == nullptr || keys.empty() ||
+        !config::enable_sql_read_pushdown()) {
+      return;
+    }
+    table_ = dynamic_cast<const QueryableTable*>(table_scan->table());
+    if (table_ == nullptr || !table_->PrimaryKey().has_value()) {
+      table_ = nullptr;
+      return;
+    }
+    const std::vector<int> primary_key = *table_->PrimaryKey();
+    absl::flat_hash_map<int, googlesql::ColumnFilter> filters;
+    for (size_t part = 0; part < primary_key.size(); ++part) {
+      std::vector<googlesql::Value> values;
+      for (const Key& key : keys) {
+        if (key.NumColumns() != static_cast<int>(primary_key.size())) {
+          table_ = nullptr;
+          return;
+        }
+        const googlesql::Value& value = key.ColumnValue(part);
+        if (std::none_of(values.begin(), values.end(),
+                         [&value](const googlesql::Value& seen) {
+                           return seen.Equals(value);
+                         })) {
+          values.push_back(value);
+        }
+      }
+      filters.emplace(primary_key[part], googlesql::ColumnFilter(values));
+    }
+    table_->SetDmlKeyFilters(std::move(filters));
+  }
+  ~ScopedDmlKeyFilters() {
+    if (table_ != nullptr) {
+      table_->ClearDmlKeyFilters();
+    }
+  }
+  ScopedDmlKeyFilters(const ScopedDmlKeyFilters&) = delete;
+  ScopedDmlKeyFilters& operator=(const ScopedDmlKeyFilters&) = delete;
+
+ private:
+  const QueryableTable* table_ = nullptr;
+};
+
+// The primary keys of the rows an INSERT ... VALUES writes, or empty when any
+// key part is not a non-NULL literal or parameter of exactly the column's type
+// (e.g. INSERT ... SELECT, a pending commit timestamp or an omitted column).
+// The evaluator reads the target table to find duplicate keys; only rows with
+// these keys can collide, so the scan is pinned to them.
+std::vector<Key> InsertedPrimaryKeys(
+    const googlesql::ResolvedInsertStmt* insert_statement,
+    const googlesql::ParameterValueMap& parameters) {
+  const auto* table = dynamic_cast<const QueryableTable*>(
+      insert_statement->table_scan()->table());
+  if (table == nullptr || !table->PrimaryKey().has_value() ||
+      insert_statement->row_list_size() == 0 ||
+      insert_statement->row_list_size() > kMaxOnConflictLookupKeys) {
+    return {};
+  }
+  std::vector<int> value_index_by_key_part;
+  std::vector<const googlesql::Type*> type_by_key_part;
+  // PrimaryKey() returns by value; iterating it directly dangles.
+  const std::vector<int> primary_key = *table->PrimaryKey();
+  for (int table_column_index : primary_key) {
+    const googlesql::Column* column = table->GetColumn(table_column_index);
+    const auto& insert_columns = insert_statement->insert_column_list();
+    auto position = std::find_if(
+        insert_columns.begin(), insert_columns.end(),
+        [column](const googlesql::ResolvedColumn& insert_column) {
+          return absl::EqualsIgnoreCase(insert_column.name(), column->Name());
+        });
+    if (position == insert_columns.end()) {
+      return {};
+    }
+    value_index_by_key_part.push_back(
+        static_cast<int>(position - insert_columns.begin()));
+    type_by_key_part.push_back(column->GetType());
+  }
+  std::vector<Key> keys;
+  for (const auto& row : insert_statement->row_list()) {
+    Key key;
+    for (size_t part = 0; part < value_index_by_key_part.size(); ++part) {
+      const int value_index = value_index_by_key_part[part];
+      if (value_index >= row->value_list_size()) {
+        return {};
+      }
+      std::optional<googlesql::Value> value =
+          ConstantValue(row->value_list(value_index)->value(), parameters);
+      if (!value.has_value() || !value->is_valid() || value->is_null() ||
+          !value->type()->Equals(type_by_key_part[part])) {
+        return {};
+      }
+      key.AddColumn(*value);
+    }
+    keys.push_back(std::move(key));
+  }
+  return keys;
+}
+
 absl::StatusOr<ExecuteUpdateResult> EvaluateResolvedInsert(
     const googlesql::ResolvedInsertStmt* insert_statement,
     const googlesql::ParameterValueMap& parameters,
@@ -717,6 +1027,9 @@ absl::StatusOr<ExecuteUpdateResult> EvaluateResolvedInsert(
 
   std::unique_ptr<googlesql::EvaluatorTableIterator> returning_iter;
   // `returning_iter` can be NULL if there is no THEN RETURN clause.
+  ScopedDmlKeyFilters key_filters(
+      insert_statement->table_scan(),
+      InsertedPrimaryKeys(insert_statement, parameters));
   auto status_or = prepared_insert->Execute(parameters, {}, &returning_iter);
   if (!status_or.ok()) {
     return MaybeTransformGoogleSQLDMLError(status_or.status());
@@ -779,6 +1092,9 @@ absl::StatusOr<ExecuteUpdateResult> EvaluateResolvedUpdate(
   GOOGLESQL_RETURN_IF_ERROR(prepared_update->Prepare(analyzer_options));
 
   std::unique_ptr<googlesql::EvaluatorTableIterator> returning_iter;
+  ScopedDmlKeyFilters key_filters(update_statement,
+                                  update_statement->table_scan(),
+                                  update_statement->where_expr(), parameters);
   auto status_or = prepared_update->Execute(parameters, {}, &returning_iter);
   if (!status_or.ok()) {
     return MaybeTransformGoogleSQLDMLError(status_or.status());
@@ -810,6 +1126,9 @@ absl::StatusOr<ExecuteUpdateResult> EvaluateResolvedDelete(
   GOOGLESQL_RETURN_IF_ERROR(prepared_delete->Prepare(analyzer_options));
 
   std::unique_ptr<googlesql::EvaluatorTableIterator> returning_iter;
+  ScopedDmlKeyFilters key_filters(delete_statement,
+                                  delete_statement->table_scan(),
+                                  delete_statement->where_expr(), parameters);
   GOOGLESQL_ASSIGN_OR_RETURN(auto iterator,
                    prepared_delete->Execute(parameters, {}, &returning_iter));
   GOOGLESQL_ASSIGN_OR_RETURN(auto cursor,
@@ -932,6 +1251,21 @@ absl::StatusOr<std::unique_ptr<RowCursor>> EvaluateQuery(
     // parameters. This is used by some drivers (e.g. JDBC) and by PGAdapter.
     return std::make_unique<VectorsRowCursor>(names, types, values);
   } else {
+    // googlesql pushes no filter for some WHEREs, e.g. a literal IN list, so
+    // derive key filters from each filter directly over a table scan.
+    std::vector<const googlesql::ResolvedNode*> filter_scans;
+    resolved_statement->GetDescendantsWithKinds(
+        {googlesql::RESOLVED_FILTER_SCAN}, &filter_scans);
+    std::vector<std::unique_ptr<ScopedDmlKeyFilters>> key_filters;
+    for (const googlesql::ResolvedNode* node : filter_scans) {
+      const auto* filter_scan = node->GetAs<googlesql::ResolvedFilterScan>();
+      if (filter_scan->input_scan()->Is<googlesql::ResolvedTableScan>()) {
+        key_filters.push_back(std::make_unique<ScopedDmlKeyFilters>(
+            resolved_statement,
+            filter_scan->input_scan()->GetAs<googlesql::ResolvedTableScan>(),
+            filter_scan->filter_expr(), params));
+      }
+    }
     // Finally execute the query.
     GOOGLESQL_ASSIGN_OR_RETURN(auto iterator, prepared_query->Execute(params));
 
@@ -1190,6 +1524,58 @@ void NormalizeParameterNames(const Schema* schema, const Query& query,
   }
 }
 
+// The conflict-target keys an INSERT ... ON CONFLICT must check for existing
+// rows: exactly the keys of the rows it inserts. Falls back to every key when
+// pushdown is off, a key part is a pending commit timestamp (always a new row),
+// or a value's type is not exactly its column's. On a unique index the key is
+// a prefix of the index key, so each one reads a prefix range.
+KeySet OnConflictLookupKeySet(
+    const Table* table, const std::string& conflict_target_name,
+    const std::vector<std::string>& conflict_target_key_columns,
+    const ExecuteUpdateResult& insert_rows) {
+  if (!config::enable_sql_read_pushdown() ||
+      insert_rows.mutation.ops().size() != 1) {
+    return KeySet::All();
+  }
+  const MutationOp& insert_op = insert_rows.mutation.ops().front();
+  if (insert_op.rows.size() > kMaxOnConflictLookupKeys) {
+    return KeySet::All();
+  }
+  std::vector<int> value_index_by_key_part;
+  std::vector<const googlesql::Type*> type_by_key_part;
+  for (const std::string& key_column : conflict_target_key_columns) {
+    auto position =
+        std::find(insert_op.columns.begin(), insert_op.columns.end(),
+                  key_column);
+    const Column* column = table->FindColumn(key_column);
+    if (position == insert_op.columns.end() || column == nullptr) {
+      return KeySet::All();
+    }
+    value_index_by_key_part.push_back(
+        static_cast<int>(position - insert_op.columns.begin()));
+    type_by_key_part.push_back(column->GetType());
+  }
+  const bool is_primary_key =
+      conflict_target_name == kReservedIndexNameForPrimaryKey;
+  KeySet key_set;
+  for (const ValueList& row : insert_op.rows) {
+    Key key;
+    for (size_t part = 0; part < value_index_by_key_part.size(); ++part) {
+      const googlesql::Value& value = row[value_index_by_key_part[part]];
+      if (!value.is_valid() || !value.type()->Equals(type_by_key_part[part])) {
+        return KeySet::All();
+      }
+      key.AddColumn(value);
+    }
+    if (is_primary_key) {
+      key_set.AddKey(key);
+    } else {
+      key_set.AddRange(KeyRange::Prefix(key));
+    }
+  }
+  return key_set;
+}
+
 }  // namespace
 
 absl::StatusOr<std::string> QueryEngine::GetDmlTargetTable(
@@ -1307,12 +1693,17 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteInsertOnConflictDml(
                      GetTimeZone(function_catalog_.GetLatestSchema()),
                      /*return_all_insert_rows_insert_ignore_dml=*/true));
 
-  // 4. Get all table rows keys. The key columns are the conflict target key
-  // columns.
+  // 4. Get the existing table row keys among the inserted ones. The key
+  // columns are the conflict target key columns.
   GOOGLESQL_ASSIGN_OR_RETURN(
       std::set<Key> original_table_row_keys,
-      GetOriginalTableRows(table, conflict_target_unique_constraint_name,
-                           conflict_target_key_columns, context.reader));
+      GetOriginalTableRows(
+          table, conflict_target_unique_constraint_name,
+          conflict_target_key_columns,
+          OnConflictLookupKeySet(table, conflict_target_unique_constraint_name,
+                                 conflict_target_key_columns,
+                                 insert_or_ignore_result),
+          context.reader));
 
   // 5. Populate the column information required for insert or update action.
   absl::flat_hash_set<int> insert_column_index_in_mutation_for_insert;
@@ -1364,6 +1755,15 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteInsertOnConflictDml(
                          insert_column_index_in_mutation_for_update,
                          conflict_target_key_columns));
 
+    // The UPDATE joins on the inserted keys, which yields no constant key
+    // filter, so a primary key target pins the scan to the existing rows.
+    std::optional<ScopedDmlKeyFilters> existing_row_filters;
+    if (conflict_target_unique_constraint_name ==
+        kReservedIndexNameForPrimaryKey) {
+      existing_row_filters.emplace(
+          update_existing_rows_resolved_stmt->table_scan(),
+          existing_rows);
+    }
     GOOGLESQL_ASSIGN_OR_RETURN(
         auto update_stmt_execute_update_result,
         EvaluateUpdate(update_existing_rows_resolved_stmt.get(), &catalog,

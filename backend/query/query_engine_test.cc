@@ -51,6 +51,7 @@
 #include "backend/query/query_context.h"
 #include "backend/query/remote_udf/remote_udf_evaluator.h"
 #include "backend/schema/catalog/schema.h"
+#include "common/config.h"
 #include "common/feature_flags.h"
 #include "common/limits.h"
 #include "tests/common/row_reader.h"
@@ -609,6 +610,119 @@ TEST_P(QueryEngineTest, InsertOnConflictDoUpdateSubqueryCanReferenceExcluded) {
 
   ASSERT_EQ(result.rows, nullptr);
   EXPECT_EQ(result.modified_row_count, 1);
+}
+
+
+// Records every read so a test can check the key set, and so the lock, a
+// statement asks for. Rows come from a TestRowReader, which ignores it.
+class RecordingRowReader : public RowReader {
+ public:
+  explicit RecordingRowReader(test::TestRowReader* rows) : rows_(rows) {}
+
+  absl::Status Read(const ReadArg& read_arg,
+                    std::unique_ptr<RowCursor>* cursor) override {
+    reads_.push_back(read_arg);
+    return rows_->Read(read_arg, cursor);
+  }
+
+  // The key sets of the base-table reads of `table`, as debug strings.
+  std::vector<std::string> BaseTableKeySets(const std::string& table) const {
+    std::vector<std::string> key_sets;
+    for (const ReadArg& read : reads_) {
+      if (read.table == table && read.index.empty()) {
+        key_sets.push_back(read.key_set.DebugString());
+      }
+    }
+    return key_sets;
+  }
+
+ private:
+  test::TestRowReader* rows_;
+  std::vector<ReadArg> reads_;
+};
+
+class QueryEnginePushdownTest : public testing::Test {
+ public:
+  void SetUp() override {
+    saved_pushdown_ = config::enable_sql_read_pushdown();
+    config::set_enable_sql_read_pushdown(true);
+  }
+
+  void TearDown() override {
+    config::set_enable_sql_read_pushdown(saved_pushdown_);
+  }
+
+  absl::StatusOr<QueryResult> Execute(const std::string& sql) {
+    return query_engine_.ExecuteSql(Query{sql},
+                                    QueryContext{schema_.get(), &reader_,
+                                                 &writer_});
+  }
+
+  const RecordingRowReader& reader() const { return reader_; }
+
+  static std::string Points(const std::vector<int64_t>& ids) {
+    KeySet key_set;
+    for (int64_t id : ids) {
+      key_set.AddKey(Key({Int64(id)}));
+    }
+    return key_set.DebugString();
+  }
+
+ private:
+  bool saved_pushdown_ = false;
+  googlesql::TypeFactory type_factory_;
+  std::unique_ptr<const Schema> schema_ =
+      test::CreateSchemaWithOneTable(&type_factory_);
+  QueryEngine query_engine_{&type_factory_, schema_.get()};
+  test::TestRowReader rows_{
+      {{"test_table",
+        {{"int64_col", "string_col"},
+         {googlesql::types::Int64Type(), googlesql::types::StringType()},
+         {{Int64(1), String("one")}, {Int64(2), String("two")}}}}}};
+  RecordingRowReader reader_{&rows_};
+  testing::NiceMock<MockRowWriter> writer_;
+};
+
+TEST_F(QueryEnginePushdownTest, DmlInUnnestReadsOnlyTheListedKeys) {
+  GOOGLESQL_ASSERT_OK(Execute("UPDATE test_table SET string_col = 'x' "
+                    "WHERE int64_col IN UNNEST([1, 3])"));
+  EXPECT_THAT(reader().BaseTableKeySets("test_table"),
+              testing::Each(Points({1, 3})));
+  EXPECT_FALSE(reader().BaseTableKeySets("test_table").empty());
+}
+
+TEST_F(QueryEnginePushdownTest, DmlFilterOnNonKeyColumnReadsTheWholeTable) {
+  GOOGLESQL_ASSERT_OK(
+      Execute("UPDATE test_table SET string_col = 'x' "
+              "WHERE string_col IN UNNEST(['one'])"));
+  EXPECT_THAT(reader().BaseTableKeySets("test_table"),
+              testing::Contains(KeySet::All().DebugString()));
+}
+
+TEST_F(QueryEnginePushdownTest, InsertOnConflictReadsOnlyTheInsertedKeys) {
+  GOOGLESQL_ASSERT_OK(
+      Execute("INSERT INTO test_table (int64_col, string_col) "
+              "VALUES (1, 'ten') "
+              "ON CONFLICT(int64_col) DO UPDATE SET string_col = "
+              "excluded.string_col"));
+  std::vector<std::string> key_sets = reader().BaseTableKeySets("test_table");
+  EXPECT_THAT(key_sets, testing::Not(testing::Contains(
+                            KeySet::All().DebugString())));
+  EXPECT_THAT(key_sets, testing::Contains(Points({1})));
+}
+
+TEST_F(QueryEnginePushdownTest, FlagOffDmlReadsTheWholeTable) {
+  config::set_enable_sql_read_pushdown(false);
+  GOOGLESQL_ASSERT_OK(Execute("UPDATE test_table SET string_col = 'x' "
+                    "WHERE int64_col IN UNNEST([1, 3])"));
+  GOOGLESQL_ASSERT_OK(
+      Execute("INSERT INTO test_table (int64_col, string_col) "
+              "VALUES (1, 'ten') "
+              "ON CONFLICT(int64_col) DO UPDATE SET string_col = "
+              "excluded.string_col"));
+  EXPECT_FALSE(reader().BaseTableKeySets("test_table").empty());
+  EXPECT_THAT(reader().BaseTableKeySets("test_table"),
+              testing::Each(KeySet::All().DebugString()));
 }
 
 TEST_P(QueryEngineTest, DetectsDMLQueries) {

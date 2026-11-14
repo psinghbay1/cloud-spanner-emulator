@@ -17,18 +17,22 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_QUERY_QUERYABLE_TABLE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_QUERY_QUERYABLE_TABLE_H_
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "googlesql/public/catalog.h"
 #include "googlesql/public/evaluator_table_iterator.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "backend/access/read.h"
 #include "backend/query/queryable_column.h"
 #include "backend/schema/catalog/change_stream.h"
+#include "backend/schema/catalog/index.h"
 #include "backend/schema/catalog/schema.h"
 #include "backend/schema/catalog/table.h"
 
@@ -75,10 +79,29 @@ class QueryableTable : public googlesql::Table {
 
   const backend::Table* wrapped_table() const { return wrapped_table_; }
 
+  // Records an index a FORCE_INDEX hint names on a scan of this table. Scans
+  // may use it to lock an index range instead of the whole table. The catalog
+  // is built per query, so this lives only for one query.
+  void RecordForcedIndex(const Index* index) const {
+    if (std::find(forced_indexes_.begin(), forced_indexes_.end(), index) ==
+        forced_indexes_.end()) {
+      forced_indexes_.push_back(index);
+    }
+  }
+
   // Override CreateEvaluatorTableIterator.
   absl::StatusOr<std::unique_ptr<googlesql::EvaluatorTableIterator>>
   CreateEvaluatorTableIterator(
       absl::Span<const int> column_idxs) const override;
+
+  // googlesql pushes no column filters into a DML statement's table scan, so
+  // the statement sets the key filters of its WHERE here, keyed by table
+  // column index, for the duration of its execution.
+  void SetDmlKeyFilters(
+      absl::flat_hash_map<int, googlesql::ColumnFilter> filters) const {
+    dml_key_filters_ = std::move(filters);
+  }
+  void ClearDmlKeyFilters() const { dml_key_filters_.clear(); }
 
  private:
   absl::StatusOr<std::unique_ptr<const googlesql::AnalyzerOutput>>
@@ -107,6 +130,10 @@ class QueryableTable : public googlesql::Table {
 
   // A list of ordinal indexes of the primary key columns of the table.
   std::vector<int> primary_key_column_indexes_;
+
+  mutable absl::flat_hash_map<int, googlesql::ColumnFilter> dml_key_filters_;
+  // Indexes named by FORCE_INDEX hints on scans of this table in this query.
+  mutable std::vector<const Index*> forced_indexes_;
 };
 
 }  // namespace backend
