@@ -215,6 +215,9 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
 
   // The schema that is in effect at the timestamp picked for this transaction.
   const Schema* schema_ ABSL_GUARDED_BY(mu_);
+  // Creation time of `schema_`, reported when a schema change aborts the
+  // transaction.
+  absl::Time schema_time_ ABSL_GUARDED_BY(mu_) = absl::InfinitePast();
 
   CaseInsensitiveStringMap<std::vector<KeyRange>> deleted_key_ranges_by_table_;
 };

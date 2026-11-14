@@ -65,6 +65,9 @@ class VersionedCatalog {
 
   void RemoveExpiredSchemas(absl::Time timestamp) ABSL_LOCKS_EXCLUDED(mu_);
 
+  // Returns the creation time of the latest schema.
+  absl::Time LatestSchemaTime() const ABSL_LOCKS_EXCLUDED(mu_);
+
   absl::Duration version_retention_period() const {
     absl::MutexLock lock(&mu_);
     return version_retention_period_;
