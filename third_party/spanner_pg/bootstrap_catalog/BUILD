@@ -169,11 +169,27 @@ genrule(
         set -e # Exit on error
 
         INCLUDE_PATH=third_party/spanner_pg/src/include
-        ENGINE_CATALOG_PATH=third_party/spanner_pg/bootstrap_catalog/spanner_pg_data
+
+        # Assemble the engine catalog in a fresh directory rather than in the
+        # source tree. In the execroot those .dat paths are symlinks back into
+        # the checkout, so copying onto them writes through to the sources and
+        # fails outright when the checkout is not writable:
+        #   cp: cannot create regular file '.../pg_aggregate.dat': Permission denied
+        ENGINE_CATALOG_PATH=$$(mktemp -d)/spanner_pg_data
+        mkdir -p $$ENGINE_CATALOG_PATH
+        # cp preserves mode, and Bazel's inputs are read-only, so each copy must
+        # be made writable before the generated file is copied over it --
+        # otherwise the second cp hits its own read-only output:
+        #   cp: cannot create regular file '.../pg_aggregate.dat': Permission denied
+        for datfile in $(locations :spanner_pg_datfiles); do
+          cp "$$datfile" $$ENGINE_CATALOG_PATH
+        done
+        chmod -R u+w $$ENGINE_CATALOG_PATH
 
         # Copies generated files into the engine catalog path
-        cp $(location //third_party/spanner_pg/codegen:pg_aggregate.dat) $$ENGINE_CATALOG_PATH
-        cp $(location //third_party/spanner_pg/codegen:pg_proc.dat) $$ENGINE_CATALOG_PATH
+        cp -f $(location //third_party/spanner_pg/codegen:pg_aggregate.dat) $$ENGINE_CATALOG_PATH
+        cp -f $(location //third_party/spanner_pg/codegen:pg_proc.dat) $$ENGINE_CATALOG_PATH
+        chmod -R u+w $$ENGINE_CATALOG_PATH
 
         $(location gen_catalog_info.pl) \
             -output /tmp \
