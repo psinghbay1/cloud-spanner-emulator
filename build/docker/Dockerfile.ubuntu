@@ -68,7 +68,26 @@ WORKDIR /src
 COPY build/bazel build/bazel/
 COPY MODULE.bazel MODULE.bazel.lock* .bazelversion .bazelrc BUILD.bazel \
     requirements.txt go.mod go.sum ./
-RUN bazel build -c opt \
+
+# .bazelrc sets --jobs=auto, which sizes parallelism to CPU count and ignores
+# memory. Compiling GoogleSQL runs many cc1plus processes that each need ~1-2 GB,
+# so on a Docker VM with less RAM than (cores x 2 GB) the build dies with
+# "gcc: fatal error: Killed signal terminated program cc1plus".
+#
+# BAZEL_JOBS caps it. Leave empty to keep the default behaviour.
+ARG BAZEL_JOBS=""
+ENV BAZEL_JOBS_ARG=${BAZEL_JOBS:+--jobs=${BAZEL_JOBS}}
+
+# GoogleSQL's tm_parser.cc is a bison-generated parser compiled as one
+# translation unit; at -O2 a single cc1plus can peak around 8-10 GB. Passing GCC
+# options that make its garbage collector run more aggressively lowers peak RSS
+# without changing generated code, e.g.
+#   --copt=--param=ggc-min-expand=10 --copt=--param=ggc-min-heapsize=32768
+# Empty by default.
+ARG GCC_MEMORY_COPTS=""
+ENV GCC_MEMORY_ARGS=${GCC_MEMORY_COPTS}
+
+RUN bazel build -c opt ${BAZEL_JOBS_ARG} ${GCC_MEMORY_ARGS} \
     @com_google_googlesql//googlesql/public:value \
     @com_google_googlesql//googlesql/public:analyzer
 
@@ -82,7 +101,7 @@ RUN find third_party/spanner_pg -name "nodes.h" -exec sed -i 's/enum NodeTag : i
 # Since we are only copying the binaries to the release image, we don't need to
 # build the rest of the targets.
 ENV EXTRA_BAZEL_ARGS="--tool_java_runtime_version=local_jdk"
-RUN bazel build -c opt \
+RUN bazel build -c opt ${BAZEL_JOBS_ARG} ${GCC_MEMORY_ARGS} \
     //binaries:emulator_main \
     //binaries:gateway_main
 
