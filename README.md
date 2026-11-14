@@ -339,6 +339,144 @@ Caveats:
 Defaults: `--enable_key_range_locking=false`,
 `--commit_reservation_wait_ms=5000` (used only when key-range locking is on).
 
+### Periodic storage purge
+
+**Problem.** The emulator keeps every committed version of every cell in
+memory. A delete only appends a deletion marker, so the row key and its old
+values stay in memory, and a superseded version is only trimmed when its cell
+is written again. A long-lived emulator therefore grows for as long as it runs,
+even when the application deletes the data it no longer needs.
+
+**What it does.** With `--storage_purge_interval` set to a positive duration,
+every database runs a background sweep at that interval which:
+
+* erases rows whose deletion is older than the database's
+  `version_retention_period` (default one hour), including the row key;
+* erases superseded versions older than the retention period, keeping the
+  newest version at or before it so reads inside the window still resolve;
+* reclaims storage of dropped tables and columns, which otherwise happens only
+  on the next schema change;
+* on glibc, calls `malloc_trim(0)` so freed memory is returned to the OS.
+
+**How to enable.** Pass the flag to `gateway_main`, or set the
+`STORAGE_PURGE_INTERVAL` environment variable, which overrides the flag:
+
+```shell
+./gateway_main --storage_purge_interval=10m
+
+docker run -p 9010:9010 -p 9020:9020 -e STORAGE_PURGE_INTERVAL=10m \
+    gcr.io/cloud-spanner-emulator/emulator
+
+docker run -p 9010:9010 -p 9020:9020 gcr.io/cloud-spanner-emulator/emulator \
+    ./gateway_main --hostname 0.0.0.0 --storage_purge_interval=10m
+```
+
+`emulator_main` accepts the same `--storage_purge_interval` flag directly. The
+value uses Go/Abseil duration syntax, e.g. `30s`, `10m`, `1h`.
+
+**Caveats.**
+
+* Only data older than `version_retention_period` is purged. Stale reads at
+  any timestamp inside the retention window return the same results as
+  before.
+* Memory is therefore released no sooner than one retention period after the
+  delete or overwrite.
+* A sweep holds the database's storage lock while it walks the data, so reads
+  and commits on that database wait for it. Prefer an interval of minutes, not
+  seconds, for large databases.
+* The default, unset or `0s`, disables the sweep.
+
+### Diagnostic SQL statements
+
+**Warning: test environments only.** `EMULATOR_RECLAIM` with
+`delete_rows => true` permanently deletes rows the application can still read.
+Neither statement exists in Cloud Spanner, so code that issues them will not
+run against a real instance.
+
+With `--enable_emulator_diagnostic_statements`, `ExecuteSql` and
+`ExecuteStreamingSql` answer two emulator-only statements. Each is recognised
+only as the whole statement, written as shown (case-insensitive, optional
+trailing `;`). They run outside any transaction, and any transaction selector
+on the request is ignored. Without the flag, both fail with the same
+`INVALID_ARGUMENT` "function not found" error as on Cloud Spanner.
+
+#### `SELECT EMULATOR_RECLAIM(...)`
+
+Reclaims memory in the session's database without waiting for the periodic
+purge or restarting the emulator. It runs the same sweep as
+`--storage_purge_interval`, scoped and bounded by its arguments, and returns
+one row:
+
+| Column            | Type    | Meaning                                                        |
+|-------------------|---------|----------------------------------------------------------------|
+| `rows_purged`     | `INT64` | Deleted rows erased, including their row keys.                 |
+| `versions_purged` | `INT64` | Superseded versions erased from live rows.                     |
+| `rows_deleted`    | `INT64` | Live rows erased by `delete_rows`; `0` unless it was passed.   |
+
+Arguments, all optional, separated by commas:
+
+| Argument                    | Default                       | Meaning |
+|-----------------------------|-------------------------------|---------|
+| `'Table'` (repeatable)      | the whole database            | Sweep only these tables and their indexes. Names are single-quoted. Unknown names are ignored. |
+| `not_before => '<RFC 3339>'` | no lower bound               | Rows first written at or before this time are never erased, and their versions at or before it are kept. Use it to protect data seeded before a test run. |
+| `not_after => '<RFC 3339>'`  | now minus `version_retention_period` | Upper bound: nothing written at or after it is touched. Replaces the retention period for this sweep, so stale reads older than it may fail. |
+| `not_after_lag => '<duration>'` | -                         | `not_after` relative to now, e.g. `'60s'`, `'5m'`. Cannot be combined with `not_after`. |
+| `delete_rows => true`       | `false`                       | **Destructive.** Also erases live rows first written strictly between `not_before` and `not_after`. Requires at least one of the bounds. |
+
+Malformed timestamps or durations, unknown argument names, unquoted table
+names, `not_before` at or after `not_after`, and an unbounded `delete_rows`
+are rejected with `INVALID_ARGUMENT`.
+
+#### `SELECT EMULATOR_LOCK_STATS()`
+
+Returns one row per table that has had a lock conflict since the emulator
+started, so a test suite can see which tables its transactions contend on.
+Conflicts are only recorded with `--enable_key_range_locking`; without it the
+result is empty.
+
+| Column                  | Type        | Meaning |
+|-------------------------|-------------|---------|
+| `table_name`            | `STRING`    | Table name, `Table.Index` for index data, `(database)` for the schema-change lock, or the internal id of a table since dropped. |
+| `whole_table_conflicts` | `INT64`     | Conflicts in which either side locked the whole table, as a query that cannot be narrowed to key ranges does. |
+| `bounded_conflicts`     | `INT64`     | Conflicts between bounded key ranges. |
+| `shared_conflicts`      | `INT64`     | Conflicts where the requester wanted a shared (read) lock. |
+| `exclusive_conflicts`   | `INT64`     | Conflicts where the requester wanted an exclusive (write) lock. |
+| `last_conflict_time`    | `TIMESTAMP` | Time of the most recent conflict. |
+
+Counters are cumulative and are not reset.
+
+#### Examples
+
+```shell
+./gateway_main --hostname localhost --enable_emulator_diagnostic_statements
+
+docker run -p 9010:9010 -p 9020:9020 gcr.io/cloud-spanner-emulator/emulator \
+    ./gateway_main --hostname 0.0.0.0 --enable_emulator_diagnostic_statements
+
+gcloud spanner databases execute-sql test-database --instance=test-instance \
+    --sql="SELECT EMULATOR_RECLAIM()"
+
+gcloud spanner databases execute-sql test-database --instance=test-instance \
+    --sql="SELECT EMULATOR_RECLAIM('Orders', 'OrderLines', not_before => '2026-01-01T12:00:00Z', not_after_lag => '60s', delete_rows => true)"
+
+gcloud spanner databases execute-sql test-database --instance=test-instance \
+    --sql="SELECT EMULATOR_LOCK_STATS()"
+```
+
+From a client library, for example Java:
+
+```java
+try (ResultSet resultSet = databaseClient.singleUse().executeQuery(
+    Statement.of("SELECT EMULATOR_RECLAIM(not_after_lag => '60s')"))) {
+  resultSet.next();
+  long rowsPurged = resultSet.getLong("rows_purged");
+}
+```
+
+`emulator_main` accepts the same flag when it is run directly.
+
+Default: `--enable_emulator_diagnostic_statements=false`.
+
 ## Frequently Asked Questions (FAQ)
 
 #### Which [client library](https://cloud.google.com/spanner/docs/reference/libraries) versions are supported?

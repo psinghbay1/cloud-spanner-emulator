@@ -17,6 +17,7 @@
 #include "backend/locking/manager.h"
 
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -84,6 +85,13 @@ bool Conflicts(LockMode held_mode, const TableID& held_table,
   return RangesOverlap(held_range, request.key_range());
 }
 
+// True when the range covers every key of the table.
+bool IsWholeTable(const KeyRange& range) {
+  const KeyRange closed_open = range.ToClosedOpen();
+  return closed_open.start_key() == Key::Empty() &&
+         closed_open.limit_key() == Key::Infinity();
+}
+
 }  // namespace
 
 std::unique_ptr<LockHandle> LockManager::CreateHandle(
@@ -137,6 +145,33 @@ std::vector<LockHandle*> LockManager::FindConflicts(
   return blockers;
 }
 
+void LockManager::RecordConflict(LockHandle* handle,
+                                 const LockRequest& request) {
+  bool whole_table = IsWholeTable(request.key_range());
+  for (const HeldLock& held : held_locks_) {
+    if (held.tid == handle->tid()) continue;
+    if (!Conflicts(held.mode, held.table_id, held.key_range, request)) continue;
+    if (IsWholeTable(held.key_range)) whole_table = true;
+  }
+  LockConflictStats& stats = conflict_stats_[request.table_id()];
+  if (whole_table) {
+    ++stats.whole_table_conflicts;
+  } else {
+    ++stats.bounded_conflicts;
+  }
+  if (request.mode() == LockMode::kExclusive) {
+    ++stats.exclusive_conflicts;
+  } else {
+    ++stats.shared_conflicts;
+  }
+  stats.last_conflict_time = absl::Now();
+}
+
+std::map<TableID, LockConflictStats> LockManager::ConflictStats() {
+  absl::MutexLock lock(mu_);
+  return conflict_stats_;
+}
+
 void LockManager::ReleaseLocksFor(TransactionID tid) {
   std::erase_if(held_locks_,
                 [tid](const HeldLock& held) { return held.tid == tid; });
@@ -162,6 +197,7 @@ void LockManager::EnqueueLock(LockHandle* handle, const LockRequest& request) {
     RecordLock(handle, request);
     return;
   }
+  RecordConflict(handle, request);
   ResolveConflict(handle, request, blockers);
 }
 

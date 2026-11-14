@@ -17,6 +17,10 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_STORAGE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_STORAGE_H_
 
+#include <cstdint>
+#include <optional>
+#include <vector>
+
 #include "googlesql/public/value.h"
 #include "absl/status/status.h"
 #include "absl/time/time.h"
@@ -30,6 +34,18 @@ namespace google {
 namespace spanner {
 namespace emulator {
 namespace backend {
+
+// Bounds a reclamation sweep by commit timestamp. Both bounds are optional.
+struct PurgeWindow {
+  // Rows first written at or before this instant are never erased, and their
+  // versions at or before it are kept. Lets a caller protect data seeded
+  // before a test run, which is the oldest data and so reached first.
+  std::optional<absl::Time> not_before;
+  // Replaces `timestamp - version_retention_period` as the upper bound, so a
+  // caller can hold back recent writes without changing the retention period,
+  // a schema change.
+  std::optional<absl::Time> not_after;
+};
 
 // Storage defines the interface for a multi-version data store.
 //
@@ -87,6 +103,45 @@ class Storage {
 
   virtual void MarkDroppedColumn(absl::Time timestamp, TableID dropped_table_id,
                                  ColumnID dropped_column_id) = 0;
+
+  // Erases rows whose newest version is a deletion marker older than
+  // `timestamp - version_retention_period`, including the row key itself.
+  //
+  // Delete() only appends a tombstone, so a deleted row that is never written
+  // again would otherwise stay in memory for the lifetime of the process. Such
+  // a row is invisible at every timestamp a transaction may still read.
+  //
+  // `table_ids` scopes the sweep; an empty vector sweeps every table. `window`
+  // narrows it further. Returns the number of row keys erased.
+  virtual int64_t PurgeExpiredDeletedRows(absl::Time timestamp,
+                                          const std::vector<TableID>& table_ids,
+                                          const PurgeWindow& window) = 0;
+
+  // Erases superseded versions older than
+  // `timestamp - version_retention_period` from every cell.
+  //
+  // Expired versions are otherwise only trimmed while their own cell is being
+  // written, so a cell that is updated and then left alone keeps them forever.
+  // The newest version at or before the retention floor is kept, so reads
+  // inside the retention window still resolve correctly.
+  //
+  // `table_ids` scopes the sweep; an empty vector sweeps every table. `window`
+  // narrows it further. Returns the number of versions erased.
+  virtual int64_t PurgeExpiredVersions(absl::Time timestamp,
+                                       const std::vector<TableID>& table_ids,
+                                       const PurgeWindow& window) = 0;
+
+  // Erases LIVE rows whose first version falls strictly inside `window`.
+  //
+  // Unlike the sweeps above this removes data a reader can still see, so it is
+  // only reached through an explicit opt-in. A window with neither bound set
+  // matches every live row in scope. Returns the number of row keys erased.
+  virtual int64_t DeleteRowsInWindow(const std::vector<TableID>& table_ids,
+                                     const PurgeWindow& window) = 0;
+
+  // Counts the rows DeleteRowsInWindow() would erase, erasing nothing.
+  virtual int64_t CountRowsInWindow(const std::vector<TableID>& table_ids,
+                                    const PurgeWindow& window) = 0;
 };
 
 }  // namespace backend

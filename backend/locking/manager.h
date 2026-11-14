@@ -17,6 +17,8 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_LOCKING_MANAGER_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_LOCKING_MANAGER_H_
 
+#include <cstdint>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -35,6 +37,18 @@ namespace google {
 namespace spanner {
 namespace emulator {
 namespace backend {
+
+// Lock conflicts seen on one table since startup. A conflict is whole-table
+// when either side's range covers the whole table, which is what a read
+// without a usable key filter takes.
+struct LockConflictStats {
+  int64_t whole_table_conflicts = 0;
+  int64_t bounded_conflicts = 0;
+  // Split by the requester's mode.
+  int64_t shared_conflicts = 0;
+  int64_t exclusive_conflicts = 0;
+  absl::Time last_conflict_time = absl::InfinitePast();
+};
 
 // LockManager represents the lock manager for a database.
 //
@@ -64,6 +78,11 @@ class LockManager {
 
   // Returns the timestamp at which last schema update or commit completed.
   absl::Time LastCommitTimestamp();
+
+  // Conflict totals since startup, keyed by table id. The empty id is the
+  // database-wide lock a schema change takes. Only key-range locking records
+  // conflicts.
+  std::map<TableID, LockConflictStats> ConflictStats() ABSL_LOCKS_EXCLUDED(mu_);
 
  private:
   // LockHandle simply forwards requests to the LockManager.
@@ -95,6 +114,10 @@ class LockManager {
                                          const LockRequest& request)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
+  // Counts one conflict on the request. Caller must hold mu_.
+  void RecordConflict(LockHandle* handle, const LockRequest& request)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
   // Records a granted lock, collapsing an exact repeat. Caller must hold mu_.
   void RecordLock(LockHandle* handle, const LockRequest& request)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
@@ -123,6 +146,9 @@ class LockManager {
 
   // Ranges currently held, across all transactions.
   std::vector<HeldLock> held_locks_ ABSL_GUARDED_BY(mu_);
+
+  // Conflict counters per table id.
+  std::map<TableID, LockConflictStats> conflict_stats_ ABSL_GUARDED_BY(mu_);
 
   // With key-range locking, the transaction whose commit timestamp is being
   // reserved: commit ordering stays serialised even though lock acquisition is

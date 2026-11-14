@@ -19,6 +19,7 @@
 #include <string>
 
 #include "absl/flags/flag.h"
+#include "absl/time/time.h"
 
 ABSL_FLAG(std::string, host_port, "localhost:10007",
           "Emulator host IP and port that serves Cloud Spanner gRPC requests.");
@@ -66,6 +67,20 @@ ABSL_FLAG(
     "timestamp before it is aborted. 0 aborts at once. Ignored when key-range "
     "locking is disabled.");
 
+ABSL_FLAG(absl::Duration, storage_purge_interval, absl::ZeroDuration(),
+          "If positive, every database runs a background sweep at this "
+          "interval that erases deleted rows and superseded versions older "
+          "than the database's version_retention_period, then returns freed "
+          "memory to the OS where the allocator supports it. Zero (the "
+          "default) disables the sweep.");
+
+ABSL_FLAG(bool, enable_emulator_diagnostic_statements, false,
+          "If true, the emulator answers the emulator-only statements "
+          "SELECT EMULATOR_RECLAIM(...), which reclaims storage and can "
+          "delete rows, and SELECT EMULATOR_LOCK_STATS(), which reports "
+          "lock conflicts per table. Intended for test environments only. "
+          "If false (the default), both fail as unknown functions.");
+
 namespace google {
 namespace spanner {
 namespace emulator {
@@ -105,6 +120,22 @@ int commit_reservation_wait_ms() {
 
 void set_commit_reservation_wait_ms(int wait_ms) {
   absl::SetFlag(&FLAGS_commit_reservation_wait_ms, wait_ms);
+}
+
+absl::Duration storage_purge_interval() {
+  return absl::GetFlag(FLAGS_storage_purge_interval);
+}
+
+void set_storage_purge_interval(absl::Duration interval) {
+  absl::SetFlag(&FLAGS_storage_purge_interval, interval);
+}
+
+bool enable_emulator_diagnostic_statements() {
+  return absl::GetFlag(FLAGS_enable_emulator_diagnostic_statements);
+}
+
+void set_enable_emulator_diagnostic_statements(bool enabled) {
+  absl::SetFlag(&FLAGS_enable_emulator_diagnostic_statements, enabled);
 }
 
 }  // namespace config

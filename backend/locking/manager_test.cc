@@ -773,6 +773,75 @@ TEST_F(LockManagerTest, DefaultWoundedHolderKeepsUpstreamMessage) {
   config::set_abort_current_transaction_probability(saved_probability);
 }
 
+TEST_F(KeyRangeLockManagerTest, NoConflictLeavesCountersEmpty) {
+  std::unique_ptr<LockHandle> t1 = Handle(1);
+  std::unique_ptr<LockHandle> t2 = Handle(2);
+  t1->EnqueueLock(Write("table", 0, 10));
+  t2->EnqueueLock(Write("table", 10, 20));
+  t2->EnqueueLock(Read("other", 0, 10));
+  EXPECT_TRUE(manager()->ConflictStats().empty());
+}
+
+TEST_F(KeyRangeLockManagerTest, CountsBoundedExclusiveConflict) {
+  std::unique_ptr<LockHandle> t1 = Handle(1);
+  std::unique_ptr<LockHandle> t2 = Handle(2);
+  t1->EnqueueLock(Write("table", 0, 10));
+  t2->EnqueueLock(Write("table", 5, 15));
+
+  auto stats = manager()->ConflictStats();
+  ASSERT_EQ(stats.size(), 1);
+  const LockConflictStats& table = stats["table"];
+  EXPECT_EQ(table.bounded_conflicts, 1);
+  EXPECT_EQ(table.whole_table_conflicts, 0);
+  EXPECT_EQ(table.exclusive_conflicts, 1);
+  EXPECT_EQ(table.shared_conflicts, 0);
+  EXPECT_GT(table.last_conflict_time, absl::InfinitePast());
+}
+
+TEST_F(KeyRangeLockManagerTest, WholeTableRequesterIsWholeTableConflict) {
+  std::unique_ptr<LockHandle> t1 = Handle(1);
+  std::unique_ptr<LockHandle> t2 = Handle(2);
+  t1->EnqueueLock(Write("table", 0, 10));
+  t2->EnqueueLock(
+      LockRequest(LockMode::kShared, "table", KeyRange::All(), {}));
+
+  LockConflictStats table = manager()->ConflictStats()["table"];
+  EXPECT_EQ(table.whole_table_conflicts, 1);
+  EXPECT_EQ(table.bounded_conflicts, 0);
+  EXPECT_EQ(table.shared_conflicts, 1);
+}
+
+TEST_F(KeyRangeLockManagerTest, WholeTableHolderIsWholeTableConflict) {
+  std::unique_ptr<LockHandle> t1 = Handle(1);
+  std::unique_ptr<LockHandle> t2 = Handle(2);
+  t1->EnqueueLock(
+      LockRequest(LockMode::kShared, "table", KeyRange::All(), {}));
+  t2->EnqueueLock(Write("table", 3, 4));
+
+  LockConflictStats table = manager()->ConflictStats()["table"];
+  EXPECT_EQ(table.whole_table_conflicts, 1);
+  EXPECT_EQ(table.bounded_conflicts, 0);
+  EXPECT_EQ(table.exclusive_conflicts, 1);
+}
+
+TEST_F(KeyRangeLockManagerTest, CountsPerTable) {
+  std::unique_ptr<LockHandle> t1 = Handle(1);
+  std::unique_ptr<LockHandle> t2 = Handle(2);
+  std::unique_ptr<LockHandle> t3 = Handle(3);
+  std::unique_ptr<LockHandle> t4 = Handle(4);
+  t1->EnqueueLock(Write("a", 0, 10));
+  t1->EnqueueLock(Write("b", 0, 10));
+  t2->EnqueueLock(Write("a", 0, 1));
+  t3->EnqueueLock(Write("a", 9, 10));
+  t4->EnqueueLock(Read("b", 0, 1));
+
+  auto stats = manager()->ConflictStats();
+  ASSERT_EQ(stats.size(), 2);
+  EXPECT_EQ(stats["a"].bounded_conflicts, 2);
+  EXPECT_EQ(stats["a"].exclusive_conflicts, 2);
+  EXPECT_EQ(stats["b"].bounded_conflicts, 1);
+  EXPECT_EQ(stats["b"].shared_conflicts, 1);
+}
 TEST_F(LockManagerTest, EnsuresSerializationWithParallelTransactions) {
   // Simulate a thread-safe mvcc store with a single key. Even though multiple
   // threads access this store, they are synchronized by the lock manager.

@@ -66,6 +66,9 @@ var (
 			"time from 20-40 seconds(default for Emulator only, not for production Spanner) to X-2X seconds.")
 	printNotices = flag.Bool("notices", false,
 		"If true, the emulator will print all third-party notices to stdout.")
+	storagePurgeInterval = flag.String("storage_purge_interval", "",
+		"If set, e.g. 10m, every database periodically erases deleted rows and superseded "+
+			"versions older than its version_retention_period. Unset disables the sweep.")
 	remoteFunctionsHostPort = flag.String("remote_functions_host_port", "",
 		"The host:port to use for remote functions.")
 	enableKeyRangeLocking = flag.Bool("enable_key_range_locking", false,
@@ -76,6 +79,10 @@ var (
 		"With --enable_key_range_locking, how long in milliseconds a committing transaction "+
 			"waits for another commit to finish before it is aborted. 0 aborts at once. "+
 			"Negative (the default) keeps the emulator's default of 5000.")
+	enableEmulatorDiagnosticStatements = flag.Bool("enable_emulator_diagnostic_statements", false,
+		"If true, the emulator answers SELECT EMULATOR_RECLAIM(...) and "+
+			"SELECT EMULATOR_LOCK_STATS(). EMULATOR_RECLAIM can delete rows; test "+
+			"environments only. Off by default: both fail as unknown functions.")
 )
 
 // resolveGRPCBinary figures out the full path to the grpc binary from the --grpc_binary flag.
@@ -109,7 +116,6 @@ func resolveGRPCBinary() string {
 
 	return retval
 }
-
 
 func main() {
 	flag.Parse()
@@ -160,6 +166,11 @@ func main() {
 		}
 	}
 
+	// STORAGE_PURGE_INTERVAL overrides --storage_purge_interval.
+	storagePurgeInterval := *storagePurgeInterval
+	if os.Getenv("STORAGE_PURGE_INTERVAL") != "" {
+		storagePurgeInterval = os.Getenv("STORAGE_PURGE_INTERVAL")
+	}
 
 	// Start the gateway http server. This will run the emulator grpc server as a subprocess and
 	// proxy http/json requests into grpc requests.
@@ -177,6 +188,8 @@ func main() {
 		RemoteFunctionsHostPort:                        *remoteFunctionsHostPort,
 		EnableKeyRangeLocking:                          *enableKeyRangeLocking,
 		CommitReservationWaitMs:                        *commitReservationWaitMs,
+		StoragePurgeInterval:                           storagePurgeInterval,
+		EnableEmulatorDiagnosticStatements:             *enableEmulatorDiagnosticStatements,
 	}
 	gw := gateway.New(gwopts)
 	gw.Run()

@@ -17,15 +17,20 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_DATABASE_DATABASE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_DATABASE_DATABASE_H_
 
+#include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
+#include <thread>  // NOLINT
 #include <vector>
 
 #include "google/spanner/admin/database/v1/common.pb.h"
 #include "googlesql/public/type.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/base/thread_annotations.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "absl/types/variant.h"
 #include "backend/actions/manager.h"
@@ -63,6 +68,9 @@ class Database {
   static absl::StatusOr<std::unique_ptr<Database>> Create(
       Clock* clock, std::string_view database_id,
       const SchemaChangeOperation& schema_change_operation);
+
+  // Stops the background storage purge, if one is running.
+  ~Database();
 
   // Creates a read only transaction attached to this database.
   absl::StatusOr<std::unique_ptr<ReadOnlyTransaction>>
@@ -122,6 +130,50 @@ class Database {
 
   PgOidAssigner* get_pg_oid_assigner() { return pg_oid_assigner_.get(); }
 
+  // Counts returned by ReclaimStorage().
+  struct ReclaimStats {
+    int64_t rows_purged = 0;
+    int64_t versions_purged = 0;
+    // Live rows erased on request; always 0 for the background sweep.
+    int64_t rows_deleted = 0;
+  };
+
+  // Reclaims memory held by data no transaction can read any more: deleted
+  // rows and superseded versions older than the version retention period, and
+  // dropped tables and columns. Then asks the allocator to return free pages to
+  // the OS where it supports that.
+  //
+  // Storage otherwise only trims a cell when that cell is written again, so a
+  // long-lived emulator grows for its whole lifetime. Reads inside the
+  // retention window are unaffected. Idempotent and safe to call concurrently
+  // with transactions.
+  ReclaimStats ReclaimStorage();
+
+  // As ReclaimStorage(), with the retention floor computed from `now`.
+  ReclaimStats ReclaimStorage(absl::Time now);
+
+  // As ReclaimStorage(), scoped and bounded by the caller.
+  //
+  // `table_names` limits the sweep to those tables and their indexes; an empty
+  // vector sweeps the whole database. Unknown names are ignored, so a caller
+  // sweeping a fixed list need not track schema changes. `window` bounds the
+  // sweep by commit timestamp; see PurgeWindow.
+  //
+  // `delete_rows_in_window` also erases LIVE rows first written inside
+  // `window`. It destroys data the application can still read and is meant
+  // only for a test harness clearing its own rows between batches.
+  ReclaimStats ReclaimStorage(const std::vector<std::string>& table_names,
+                              const PurgeWindow& window,
+                              bool delete_rows_in_window);
+
+  // Lock-conflict totals since startup, keyed by table name. Index data is
+  // reported as "Table.Index", the database-wide schema lock as "(database)",
+  // and a table since dropped by its storage id.
+  std::map<std::string, LockConflictStats> LockConflictStatsByTable();
+
+  // Number of sweeps completed by the background storage purge.
+  int64_t background_purge_count() const ABSL_LOCKS_EXCLUDED(purge_mu_);
+
  private:
   Database();
   // Delete copy and assignment operators since database shouldn't be copyable.
@@ -129,6 +181,16 @@ class Database {
   Database& operator=(const Database&) = delete;
 
   SchemaChangeContext GetSchemaChangeContext();
+
+  // Shared body of the ReclaimStorage() overloads.
+  ReclaimStats ReclaimTableIds(absl::Time now,
+                               const std::vector<TableID>& table_ids,
+                               const PurgeWindow& window,
+                               bool delete_rows_in_window);
+
+  // Runs ReclaimStorage() every `interval` until the destructor signals stop.
+  void RunStoragePurgeLoop(absl::Duration interval)
+      ABSL_LOCKS_EXCLUDED(purge_mu_);
 
   // Clock to provide commit timestamps.
   Clock* clock_;
@@ -177,6 +239,16 @@ class Database {
 
   // Assigns OIDs to database objects when dialect is POSTGRESQL.
   std::unique_ptr<PgOidAssigner> pg_oid_assigner_;
+
+  // State of the background storage purge, started only when
+  // --storage_purge_interval is positive.
+  mutable absl::Mutex purge_mu_;
+  bool stop_purge_ ABSL_GUARDED_BY(purge_mu_) = false;
+  int64_t background_purge_count_ ABSL_GUARDED_BY(purge_mu_) = 0;
+
+  // Declared last so it is started after, and joined before, everything it
+  // touches.
+  std::thread purge_thread_;
 };
 
 }  // namespace backend

@@ -17,6 +17,9 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_IN_MEMORY_STORAGE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_IN_MEMORY_STORAGE_H_
 
+#include <cstdint>
+#include <vector>
+
 #include "googlesql/public/value.h"
 #include "absl/time/time.h"
 #include "backend/common/ids.h"
@@ -78,11 +81,39 @@ class InMemoryStorage : public Storage {
                          ColumnID dropped_column_id) override
       ABSL_LOCKS_EXCLUDED(mu_);
 
+  int64_t PurgeExpiredDeletedRows(absl::Time timestamp,
+                                  const std::vector<TableID>& table_ids,
+                                  const PurgeWindow& window) override
+      ABSL_LOCKS_EXCLUDED(mu_);
+
+  int64_t PurgeExpiredVersions(absl::Time timestamp,
+                               const std::vector<TableID>& table_ids,
+                               const PurgeWindow& window) override
+      ABSL_LOCKS_EXCLUDED(mu_);
+
+  int64_t DeleteRowsInWindow(const std::vector<TableID>& table_ids,
+                             const PurgeWindow& window) override
+      ABSL_LOCKS_EXCLUDED(mu_);
+
+  int64_t CountRowsInWindow(const std::vector<TableID>& table_ids,
+                            const PurgeWindow& window) override
+      ABSL_LOCKS_EXCLUDED(mu_);
+
  private:
   using Cell = std::map<absl::Time, googlesql::Value>;
   using Row = absl::flat_hash_map<ColumnID, Cell>;
   using Table = std::map<Key, Row>;
   using Tables = absl::flat_hash_map<TableID, Table>;
+
+  // True when the row's first commit falls strictly inside `window`. Shared by
+  // DeleteRowsInWindow() and CountRowsInWindow() so they cannot disagree.
+  static bool RowCreatedInWindow(const Row& row, const PurgeWindow& window);
+
+  // Applies `visit` to every table in `table_ids`, or to every table when
+  // `table_ids` is empty. Unknown ids are skipped.
+  template <typename Visitor>
+  void ForEachTable(const std::vector<TableID>& table_ids, Visitor visit)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   // Returns true if the given row is valid at the specified timestamp.
   bool Exists(const Row& row, absl::Time timestamp) const
