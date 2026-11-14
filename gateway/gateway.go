@@ -59,6 +59,8 @@ type Options struct {
 	EnableKeyRangeLocking bool
 	// Forwarded to emulator_main as --commit_reservation_wait_ms when >= 0.
 	CommitReservationWaitMs int
+	// Forwarded to emulator_main as --lock_conflict_policy when non-empty.
+	LockConflictPolicy string
 }
 
 // Gateway implements the emulator gateway server.
@@ -105,6 +107,10 @@ func (gw *Gateway) Run() {
 	if gw.opts.CommitReservationWaitMs >= 0 {
 		emulatorArgs = append(emulatorArgs,
 			fmt.Sprintf("--commit_reservation_wait_ms=%d", gw.opts.CommitReservationWaitMs))
+	}
+	if gw.opts.LockConflictPolicy != "" {
+		emulatorArgs = append(emulatorArgs,
+			fmt.Sprintf("--lock_conflict_policy=%s", gw.opts.LockConflictPolicy))
 	}
 
 

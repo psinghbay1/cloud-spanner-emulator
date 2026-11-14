@@ -76,6 +76,11 @@ var (
 		"With --enable_key_range_locking, how long in milliseconds a committing transaction "+
 			"waits for another commit to finish before it is aborted. 0 aborts at once. "+
 			"Negative (the default) keeps the emulator's default of 5000.")
+	lockConflictPolicy = flag.String("lock_conflict_policy", "",
+		"With --enable_key_range_locking, how a lock conflict is resolved: 'random' "+
+			"(the emulator's default) aborts the holder with --abort_current_transaction_probability, "+
+			"else the requester; 'wound_wait' lets the older transaction win, as Cloud Spanner does. "+
+			"Empty (the default) keeps the emulator's default.")
 )
 
 // resolveGRPCBinary figures out the full path to the grpc binary from the --grpc_binary flag.
@@ -177,6 +182,7 @@ func main() {
 		RemoteFunctionsHostPort:                        *remoteFunctionsHostPort,
 		EnableKeyRangeLocking:                          *enableKeyRangeLocking,
 		CommitReservationWaitMs:                        *commitReservationWaitMs,
+		LockConflictPolicy:                             *lockConflictPolicy,
 	}
 	gw := gateway.New(gwopts)
 	gw.Run()

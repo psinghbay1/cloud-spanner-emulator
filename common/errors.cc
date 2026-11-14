@@ -606,6 +606,30 @@ absl::Status AbortConflictingKeyRange(int64_t requestor_id, int64_t holder_id,
                    "' range ", key_range, ". Rule: ", rule, "."));
 }
 
+absl::Status WoundedByOlderTransaction(backend::TransactionID holder_id,
+                                       backend::TransactionID requestor_id) {
+  return absl::Status(
+      absl::StatusCode::kAborted,
+      absl::StrCat("Transaction: ", holder_id, " aborted due to transaction ",
+                   requestor_id,
+                   " getting priority: it requested a lock on a key range "
+                   "that overlaps one this transaction holds. Rule: "
+                   "wound-wait (an older transaction wounds a younger "
+                   "holder)."));
+}
+
+absl::Status AbortYoungerRequester(int64_t requestor_id, int64_t holder_id,
+                                   absl::string_view table_id,
+                                   absl::string_view key_range) {
+  return absl::Status(
+      absl::StatusCode::kAborted,
+      absl::StrCat("Transaction ", requestor_id, " aborted: transaction ",
+                   holder_id, " holds a conflicting lock on table '", table_id,
+                   "' range ", key_range,
+                   ". Rule: wound-wait (a younger requester does not wound an "
+                   "older holder)."));
+}
+
 absl::Status AbortCurrentTransaction(backend::TransactionID holder_id,
                                      backend::TransactionID requestor_id,
                                      absl::string_view rule) {

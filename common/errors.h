@@ -158,6 +158,13 @@ absl::Status AbortConflictingKeyRange(int64_t requestor_id, int64_t holder_id,
                                           "random preemption");
 absl::Status WoundedTransaction(backend::TransactionID id,
                                 absl::string_view rule = "");
+// Wound-wait: an older requester aborted this younger holder.
+absl::Status WoundedByOlderTransaction(backend::TransactionID holder_id,
+                                       backend::TransactionID requestor_id);
+// Wound-wait: this younger requester is aborted rather than left to wait.
+absl::Status AbortYoungerRequester(int64_t requestor_id, int64_t holder_id,
+                                   absl::string_view table_id,
+                                   absl::string_view key_range);
 absl::Status CouldNotObtainLockHandleMutex(backend::TransactionID id);
 absl::Status CouldNotObtainTransactionMutex(backend::TransactionID id);
 absl::Status TransactionNotFound(backend::TransactionID id);

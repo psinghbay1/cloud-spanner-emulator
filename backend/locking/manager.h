@@ -108,11 +108,23 @@ class LockManager {
                        const std::vector<LockHandle*>& blockers)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
-  // Aborts every blocker and grants the request, or returns false if one
-  // cannot be aborted. Caller must hold mu_.
-  bool WoundAll(LockHandle* handle, const LockRequest& request,
-                const std::vector<LockHandle*>& blockers)
+  // Under --lock_conflict_policy=wound_wait: the older transaction wins.
+  // Caller must hold mu_.
+  void ResolveConflictByWoundWait(LockHandle* handle,
+                                  const LockRequest& request,
+                                  const std::vector<LockHandle*>& blockers)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  // Aborts every blocker and grants the request, or returns false if one
+  // cannot be aborted. wound_wait selects the error the blockers see. Caller
+  // must hold mu_.
+  bool WoundAll(LockHandle* handle, const LockRequest& request,
+                const std::vector<LockHandle*>& blockers, bool wound_wait)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  // True when lhs began first: lower priority (begin time, kept across
+  // retries), then lower transaction id.
+  static bool IsOlder(LockHandle* lhs, LockHandle* rhs);
 
   // The pre-flag whole-database lock. Caller must hold mu_.
   void EnqueueDatabaseLock(LockHandle* handle)

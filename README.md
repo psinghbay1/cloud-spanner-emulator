@@ -329,15 +329,72 @@ Caveats:
 - Conflicting transactions are still aborted with `ABORTED`, as before; a
   conflicting request never waits for the lock. Clients must keep retrying
   aborted transactions, as they must against Cloud Spanner.
-- When two transactions conflict, the holder is aborted with probability
-  `--abort_current_transaction_probability` and otherwise the requester is
-  aborted -- the same rule the database-wide lock uses. This is not Cloud
-  Spanner's wound-wait ordering.
+- By default, when two transactions conflict, the holder is aborted with
+  probability `--abort_current_transaction_probability` and otherwise the
+  requester is aborted -- the same rule the database-wide lock uses. For Cloud
+  Spanner's wound-wait ordering, add `--lock_conflict_policy=wound_wait`; see
+  [Deterministic conflict resolution
+  (wound-wait)](#deterministic-conflict-resolution-wound-wait).
 - Locking is conservative: a range the emulator cannot narrow is locked whole,
   so it can report a conflict Cloud Spanner would not, but never the reverse.
 
 Defaults: `--enable_key_range_locking=false`,
 `--commit_reservation_wait_ms=5000` (used only when key-range locking is on).
+
+### Deterministic conflict resolution (wound-wait)
+
+With key-range locking, a conflict between two transactions is by default
+settled by a coin flip: the holder is aborted with probability
+`--abort_current_transaction_probability` (default `20`), otherwise the
+requester is. Which transaction survives therefore changes from run to run, a
+long transaction can be aborted repeatedly by newcomers, and tests that pass
+against Cloud Spanner can be flaky against the emulator.
+
+`--lock_conflict_policy=wound_wait` resolves conflicts by transaction age, as
+Cloud Spanner does:
+
+- A transaction's age is its begin time. A transaction retried after `ABORTED`
+  in the same session keeps the begin time of its first attempt, so it grows
+  older with each retry and eventually wins. Equal begin times are ordered by
+  transaction id.
+- If the requester is older than every conflicting holder, it **wounds** them:
+  each holder is aborted with `ABORTED` and the requester gets the lock.
+- If the requester is younger than any conflicting holder, the requester is
+  aborted with `ABORTED`. It does not wait for the lock; the client retries it,
+  as it would after any abort.
+- If a younger holder cannot be aborted (for example it is already
+  committing), the requester is aborted instead and no holder is touched.
+- A schema change never wounds a transaction; it is aborted if it conflicts.
+
+The error message of every abort names the rule that applied (`Rule:
+wound-wait` or `Rule: random preemption`), so a failure shows which policy
+decided it.
+
+Enable it together with key-range locking:
+
+```shell
+./gateway_main --hostname localhost --enable_key_range_locking \
+    --lock_conflict_policy=wound_wait
+```
+
+or with the docker image:
+
+```shell
+docker run -p 9010:9010 -p 9020:9020 gcr.io/cloud-spanner-emulator/emulator \
+    ./gateway_main --hostname 0.0.0.0 --enable_key_range_locking \
+    --lock_conflict_policy=wound_wait
+```
+
+`emulator_main` accepts the same flag when it is run directly.
+
+The policy applies only to key-range conflicts. Without
+`--enable_key_range_locking` the flag is ignored and the database-wide lock
+keeps its existing rule. Under wound-wait,
+`--abort_current_transaction_probability` is not consulted for key-range
+conflicts.
+
+Defaults: `--lock_conflict_policy=random`, the existing behaviour. Any value
+other than `wound_wait` is treated as `random`.
 
 ## Frequently Asked Questions (FAQ)
 
