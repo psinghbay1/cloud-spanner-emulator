@@ -102,6 +102,7 @@ cc_library(
         "//frontend/handlers",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/memory",
+        "@com_google_absl//absl/time",
         "@com_google_googleapis//google/iam/v1:iam_policy_cc_proto",
         "@com_google_googleapis//google/iam/v1:policy_cc_proto",
         "@com_google_googleapis//google/rpc:error_details_cc_proto",

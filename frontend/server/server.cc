@@ -34,6 +34,8 @@
 #include "google/spanner/v1/spanner.pb.h"
 #include "google/spanner/v1/transaction.pb.h"
 #include "absl/memory/memory.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "common/constants.h"
 #include "common/errors.h"
 #include "common/limits.h"
@@ -350,6 +352,10 @@ std::unique_ptr<Server> Server::Create(const Server::Options& options) {
 void Server::WaitForShutdown() { grpc_server_->Wait(); }
 
 void Server::Shutdown() { grpc_server_->Shutdown(); }
+
+void Server::Shutdown(absl::Duration grace) {
+  grpc_server_->Shutdown(absl::ToChronoTime(absl::Now() + grace));
+}
 
 }  // namespace frontend
 }  // namespace emulator
