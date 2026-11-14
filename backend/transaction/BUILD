@@ -281,7 +281,9 @@ cc_test(
     ],
     deps = [
         ":read_only_transaction",
+        "//backend/access:read",
         "//backend/common:ids",
+        "//backend/datamodel:key_set",
         "//backend/schema/catalog:schema",
         "//backend/schema/catalog:versioned_catalog",
         "//backend/storage:in_memory_storage",

@@ -26,8 +26,12 @@
 #include "googlesql/base/testing/status_matchers.h"
 #include "tests/common/proto_matchers.h"
 #include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
+#include "absl/time/time.h"
 #include "backend/access/read.h"
 #include "backend/datamodel/key_set.h"
+#include "backend/schema/catalog/schema.h"
 #include "backend/schema/updater/schema_updater.h"
 #include "backend/transaction/options.h"
 #include "common/clock.h"
@@ -45,6 +49,21 @@ using googlesql_base::testing::StatusIs;
 
 constexpr char kDatabaseId[] = "test-db";
 
+// Sets --schema_version_retention for one test and restores it afterwards.
+class ScopedSchemaVersionRetention {
+ public:
+  explicit ScopedSchemaVersionRetention(absl::Duration retention)
+      : previous_(config::schema_version_retention()) {
+    config::set_schema_version_retention(retention);
+  }
+  ~ScopedSchemaVersionRetention() {
+    config::set_schema_version_retention(previous_);
+  }
+
+ private:
+  const absl::Duration previous_;
+};
+
 class DatabaseTest : public ::testing::Test {
  public:
   DatabaseTest() = default;
@@ -55,6 +74,45 @@ class DatabaseTest : public ::testing::Test {
     args.key_set = KeySet::All();
     args.columns = std::vector<std::string>{column_name};
     return args;
+  }
+
+  // Creates table T, then adds c1 and c2 in two DDL batches. Returns a
+  // timestamp between the two batches, covered by the c1-only schema.
+  absl::Time CreateDatabaseWithTwoDdlBatches(std::unique_ptr<Database>* db) {
+    std::vector<std::string> create_statements = {R"(
+      CREATE TABLE T(
+        k1 INT64,
+        k2 INT64,
+      ) PRIMARY KEY(k1)
+    )"};
+    auto created = Database::Create(
+        &clock_, kDatabaseId,
+        SchemaChangeOperation{.statements = create_statements});
+    EXPECT_TRUE(created.ok()) << created.status();
+    *db = std::move(*created);
+    AddColumn(db->get(), "c1");
+    const absl::Time between_ddls = clock_.Now();
+    AddColumn(db->get(), "c2");
+    return between_ddls;
+  }
+
+  void AddColumn(Database* db, absl::string_view column) {
+    absl::Status backfill_status;
+    int completed_statements;
+    absl::Time commit_ts;
+    GOOGLESQL_EXPECT_OK(db->UpdateSchema(
+        SchemaChangeOperation{.statements = {absl::StrCat(
+                                  "ALTER TABLE T ADD COLUMN ", column,
+                                  " INT64")}},
+        &completed_statements, &commit_ts, &backfill_status));
+    GOOGLESQL_EXPECT_OK(backfill_status);
+  }
+
+  static ReadOnlyOptions ExactTimestamp(absl::Time timestamp) {
+    ReadOnlyOptions options;
+    options.bound = TimestampBound::kExactTimestamp;
+    options.timestamp = timestamp;
+    return options;
   }
 
  protected:
@@ -264,6 +322,94 @@ TEST_F(DatabaseTest, ConcurrentSchemaChangeIsAborted) {
       error::ConcurrentSchemaChangeOrReadWriteTxnInProgress());
 
   config::set_abort_current_transaction_probability(current_probability);
+}
+
+// Without --schema_version_retention every schema version stays readable for
+// the version retention period, as before the flag existed.
+TEST_F(DatabaseTest, DefaultSchemaVersionRetentionKeepsOldVersionsReadable) {
+  ScopedSchemaVersionRetention retention(absl::InfiniteDuration());
+  std::unique_ptr<Database> db;
+  const absl::Time between_ddls = CreateDatabaseWithTwoDdlBatches(&db);
+
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<ReadOnlyTransaction> txn,
+      db->CreateReadOnlyTransaction(ExactTimestamp(between_ddls)));
+  std::unique_ptr<RowCursor> row_cursor;
+  GOOGLESQL_EXPECT_OK(txn->Read(read_column("T", "c1"), &row_cursor));
+  EXPECT_EQ(txn->schema()->FindTable("T")->FindColumn("c2"), nullptr);
+}
+
+// With --schema_version_retention=0s each DDL batch drops the versions it
+// supersedes, and a read at a timestamp they covered is refused with the
+// retention error rather than served with a newer schema.
+TEST_F(DatabaseTest, ZeroSchemaVersionRetentionRefusesReadsAtPrunedVersions) {
+  ScopedSchemaVersionRetention retention(absl::ZeroDuration());
+  std::unique_ptr<Database> db;
+  const absl::Time between_ddls = CreateDatabaseWithTwoDdlBatches(&db);
+
+  EXPECT_THAT(db->CreateReadOnlyTransaction(ExactTimestamp(between_ddls)),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
+
+  ReadOnlyOptions strong;
+  strong.bound = TimestampBound::kStrongRead;
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReadOnlyTransaction> txn,
+                       db->CreateReadOnlyTransaction(strong));
+  std::unique_ptr<RowCursor> row_cursor;
+  GOOGLESQL_EXPECT_OK(txn->Read(read_column("T", "c2"), &row_cursor));
+}
+
+// A snapshot that resolved its schema before a prune keeps that version
+// pinned, so retention cannot free a schema still in use.
+TEST_F(DatabaseTest, InFlightSnapshotKeepsSchemaAcrossRetentionPrune) {
+  ScopedSchemaVersionRetention retention(absl::ZeroDuration());
+  std::vector<std::string> create_statements = {R"(
+    CREATE TABLE T(
+      k1 INT64,
+      k2 INT64,
+    ) PRIMARY KEY(k1)
+  )"};
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<Database> db,
+      Database::Create(&clock_, kDatabaseId,
+                       SchemaChangeOperation{.statements = create_statements}));
+  AddColumn(db.get(), "c1");
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<ReadOnlyTransaction> txn,
+      db->CreateReadOnlyTransaction(ExactTimestamp(clock_.Now())));
+  const Schema* pinned = txn->schema();
+  ASSERT_NE(pinned->FindTable("T")->FindColumn("c1"), nullptr);
+
+  AddColumn(db.get(), "c2");
+
+  EXPECT_EQ(txn->schema(), pinned);
+  EXPECT_EQ(pinned->FindTable("T")->FindColumn("c2"), nullptr);
+  std::unique_ptr<RowCursor> row_cursor;
+  GOOGLESQL_EXPECT_OK(txn->Read(read_column("T", "c1"), &row_cursor));
+}
+
+// A read-write transaction created before several DDL batches under
+// --schema_version_retention=0s initialises on the latest schema.
+TEST_F(DatabaseTest, ReadWriteTransactionUsesLatestSchemaAfterRetentionPrune) {
+  ScopedSchemaVersionRetention retention(absl::ZeroDuration());
+  std::vector<std::string> create_statements = {R"(
+    CREATE TABLE T(
+      k1 INT64,
+      k2 INT64,
+    ) PRIMARY KEY(k1)
+  )"};
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<Database> db,
+      Database::Create(&clock_, kDatabaseId,
+                       SchemaChangeOperation{.statements = create_statements}));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<ReadWriteTransaction> txn,
+      db->CreateReadWriteTransaction(ReadWriteOptions(), RetryState()));
+  AddColumn(db.get(), "c1");
+  AddColumn(db.get(), "c2");
+
+  std::unique_ptr<RowCursor> row_cursor;
+  GOOGLESQL_EXPECT_OK(txn->Read(read_column("T", "c2"), &row_cursor));
+  GOOGLESQL_EXPECT_OK(txn->Rollback());
 }
 
 TEST_F(DatabaseTest, SchemaChangeLocksSuccesfullyReleased) {

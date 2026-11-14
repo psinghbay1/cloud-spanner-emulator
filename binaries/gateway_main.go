@@ -66,6 +66,12 @@ var (
 			"time from 20-40 seconds(default for Emulator only, not for production Spanner) to X-2X seconds.")
 	printNotices = flag.Bool("notices", false,
 		"If true, the emulator will print all third-party notices to stdout.")
+	schemaVersionRetention = flag.String("schema_version_retention", "",
+		"How long superseded schema versions are kept after a newer DDL batch is applied, "+
+			"as a Go-style duration (e.g. 0s keeps only the latest version). Lowers memory "+
+			"after many DDL batches; snapshot reads older than the oldest kept version then "+
+			"fail. Unset keeps versions for the database's version_retention_period. "+
+			"The SCHEMA_VERSION_RETENTION environment variable overrides this flag.")
 	remoteFunctionsHostPort = flag.String("remote_functions_host_port", "",
 		"The host:port to use for remote functions.")
 )
@@ -100,6 +106,15 @@ func resolveGRPCBinary() string {
 	}
 
 	return retval
+}
+
+// resolveSchemaVersionRetention lets docker users set the retention without
+// overriding the image's command line.
+func resolveSchemaVersionRetention() string {
+	if retention := os.Getenv("SCHEMA_VERSION_RETENTION"); retention != "" {
+		return retention
+	}
+	return *schemaVersionRetention
 }
 
 
@@ -167,6 +182,7 @@ func main() {
 		OverrideMaxDatabasesPerInstance:    instanceDbs,
 		OverrideChangeStreamPartitionTokenAliveSeconds: overrideChangeStreamPartitionTokenAliveSeconds,
 		RemoteFunctionsHostPort:                        *remoteFunctionsHostPort,
+		SchemaVersionRetention:                         resolveSchemaVersionRetention(),
 	}
 	gw := gateway.New(gwopts)
 	gw.Run()

@@ -215,6 +215,9 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
 
   // The schema that is in effect at the timestamp picked for this transaction.
   const Schema* schema_ ABSL_GUARDED_BY(mu_);
+  // Its creation time. Concurrent schema changes are detected by comparing
+  // this, not `schema_`: a pruned version's address can be reused by the next.
+  absl::Time schema_time_ ABSL_GUARDED_BY(mu_) = absl::InfinitePast();
 
   CaseInsensitiveStringMap<std::vector<KeyRange>> deleted_key_ranges_by_table_;
 };

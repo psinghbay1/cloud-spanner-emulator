@@ -68,9 +68,9 @@ absl::Status ReadOnlyTransaction::Read(const ReadArg& read_arg,
   if (now - read_timestamp_ >= version_retention_period_) {
     return error::ReadTimestampPastVersionGCLimit(read_timestamp_);
   }
-
+  GOOGLESQL_ASSIGN_OR_RETURN(const Schema* schema, PinSchema());
   GOOGLESQL_ASSIGN_OR_RETURN(const ResolvedReadArg resolved_read_arg,
-                   ResolveReadArg(read_arg, schema()));
+                   ResolveReadArg(read_arg, schema));
 
   // Clean up any dropped tables that are eligible for deletion.
   // This is inexpensive to do so it can be done for every read.
@@ -94,7 +94,25 @@ const Schema* ReadOnlyTransaction::schema() const {
   // Wait for any concurrent schema change or read-write transactions to commit
   // before accessing database state to read schemas in versioned_catalog.
   lock_handle_->WaitForSafeRead(read_timestamp_);
-  return versioned_catalog_->GetSchema(read_timestamp_);
+  absl::MutexLock lock(pin_mu_);
+  if (pinned_schema_ == nullptr) {
+    pinned_schema_ = versioned_catalog_->GetSchemaShared(read_timestamp_);
+  }
+  return pinned_schema_.get();
+}
+
+absl::StatusOr<const Schema*> ReadOnlyTransaction::PinSchema() const {
+  absl::MutexLock lock(pin_mu_);
+  if (pinned_schema_ != nullptr) {
+    return pinned_schema_.get();
+  }
+  // The version in effect at this timestamp was pruned (schema-version
+  // retention) before this transaction resolved it; a newer one would be wrong.
+  if (read_timestamp_ < versioned_catalog_->MinReadableSchemaTime()) {
+    return error::ReadTimestampPastVersionGCLimit(read_timestamp_);
+  }
+  pinned_schema_ = versioned_catalog_->GetSchemaShared(read_timestamp_);
+  return pinned_schema_.get();
 }
 
 absl::Time ReadOnlyTransaction::PickReadTimestamp() {

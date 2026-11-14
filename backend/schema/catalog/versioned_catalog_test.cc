@@ -128,6 +128,67 @@ TEST(VersionedCatalogTest, ExpiredSchemasThatCoverRetentionPeriodAreKept) {
   EXPECT_EQ(catalog.GetSchema(t0), catalog.GetSchema(absl::InfinitePast()));
 }
 
+TEST(VersionedCatalogTest, EagerRetentionUnsetKeepsEveryVersion) {
+  VersionedCatalog catalog;
+  absl::Time t0 = absl::Now();
+  GOOGLESQL_EXPECT_OK(catalog.AddSchema(t0, std::make_unique<const Schema>()));
+  GOOGLESQL_EXPECT_OK(
+      catalog.AddSchema(t0 + absl::Minutes(1), std::make_unique<const Schema>()));
+  GOOGLESQL_EXPECT_OK(
+      catalog.AddSchema(t0 + absl::Minutes(2), std::make_unique<const Schema>()));
+  // Three distinct versions, all still resolvable; nothing was ever erased.
+  EXPECT_NE(catalog.GetSchema(t0), catalog.GetSchema(t0 + absl::Minutes(1)));
+  EXPECT_NE(catalog.GetSchema(t0 + absl::Minutes(1)),
+            catalog.GetSchema(t0 + absl::Minutes(2)));
+  EXPECT_EQ(catalog.MinReadableSchemaTime(), absl::InfinitePast());
+  EXPECT_EQ(catalog.LatestSchemaTime(), t0 + absl::Minutes(2));
+}
+
+TEST(VersionedCatalogTest, ZeroEagerRetentionKeepsLatestOnly) {
+  VersionedCatalog catalog;
+  catalog.set_schema_version_retention(absl::ZeroDuration());
+  absl::Time t0 = absl::Now();
+  absl::Time t1 = t0 + absl::Minutes(1);
+  absl::Time t2 = t0 + absl::Minutes(2);
+  GOOGLESQL_EXPECT_OK(catalog.AddSchema(t0, std::make_unique<const Schema>()));
+  GOOGLESQL_EXPECT_OK(catalog.AddSchema(t1, std::make_unique<const Schema>()));
+  GOOGLESQL_EXPECT_OK(catalog.AddSchema(t2, std::make_unique<const Schema>()));
+  // Only the sentinel and the latest remain: a read at t0 or t1 resolves to
+  // the sentinel, and MinReadableSchemaTime says such reads must be refused.
+  EXPECT_EQ(catalog.GetSchema(t0), catalog.GetSchema(absl::InfinitePast()));
+  EXPECT_EQ(catalog.GetSchema(t1), catalog.GetSchema(absl::InfinitePast()));
+  EXPECT_EQ(catalog.GetSchema(t2), catalog.GetLatestSchema());
+  EXPECT_EQ(catalog.MinReadableSchemaTime(), t2);
+}
+
+TEST(VersionedCatalogTest, PruneSchemasOlderThanKeepsCoveringVersion) {
+  VersionedCatalog catalog;
+  absl::Time t0 = absl::Now();
+  absl::Time t1 = t0 + absl::Minutes(10);
+  absl::Time t2 = t0 + absl::Minutes(20);
+  absl::Time t3 = t0 + absl::Minutes(30);
+  GOOGLESQL_EXPECT_OK(catalog.AddSchema(t0, std::make_unique<const Schema>()));
+  GOOGLESQL_EXPECT_OK(catalog.AddSchema(t1, std::make_unique<const Schema>()));
+  GOOGLESQL_EXPECT_OK(catalog.AddSchema(t2, std::make_unique<const Schema>()));
+  GOOGLESQL_EXPECT_OK(catalog.AddSchema(t3, std::make_unique<const Schema>()));
+
+  // Cutoff between t1 and t2: t0 goes, t1 stays because it is the version in
+  // effect at the cutoff, t2 and t3 are newer than the cutoff.
+  EXPECT_EQ(catalog.PruneSchemasOlderThan(t1 + absl::Minutes(5)), 1);
+  EXPECT_EQ(catalog.GetSchema(t0), catalog.GetSchema(absl::InfinitePast()));
+  EXPECT_NE(catalog.GetSchema(t1), catalog.GetSchema(absl::InfinitePast()));
+  EXPECT_EQ(catalog.MinReadableSchemaTime(), t1);
+
+  // Nothing older than the covering version is left: idempotent.
+  EXPECT_EQ(catalog.PruneSchemasOlderThan(t1 + absl::Minutes(5)), 0);
+
+  // Cutoff in the future keeps the latest only.
+  EXPECT_EQ(catalog.PruneSchemasOlderThan(absl::InfiniteFuture()), 2);
+  EXPECT_EQ(catalog.GetSchema(t2), catalog.GetSchema(absl::InfinitePast()));
+  EXPECT_EQ(catalog.GetSchema(t3), catalog.GetLatestSchema());
+  EXPECT_EQ(catalog.MinReadableSchemaTime(), t3);
+}
+
 }  // namespace
 }  // namespace backend
 }  // namespace emulator

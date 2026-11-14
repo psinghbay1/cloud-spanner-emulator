@@ -19,6 +19,8 @@
 
 #include <string>
 
+#include "absl/time/time.h"
+
 namespace google {
 namespace spanner {
 namespace emulator {
@@ -53,6 +55,13 @@ bool disable_query_null_filtered_index_check();
 int abort_current_transaction_probability();
 
 void set_abort_current_transaction_probability(int probability);
+
+// How long a superseded schema version is kept once a newer DDL batch lands.
+// Unset (absl::InfiniteDuration(), the default) keeps versions for the
+// database's version_retention_period. Zero keeps only the latest version.
+bool schema_version_retention_set();
+absl::Duration schema_version_retention();
+void set_schema_version_retention(absl::Duration retention);
 
 }  // namespace config
 }  // namespace emulator

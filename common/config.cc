@@ -19,6 +19,7 @@
 #include <string>
 
 #include "absl/flags/flag.h"
+#include "absl/time/time.h"
 
 ABSL_FLAG(std::string, host_port, "localhost:10007",
           "Emulator host IP and port that serves Cloud Spanner gRPC requests.");
@@ -51,6 +52,16 @@ ABSL_FLAG(
     "to the current transaction. A value of zero means that the emulator will "
     "never abort the current transaction.");
 
+ABSL_FLAG(
+    absl::Duration, schema_version_retention, absl::InfiniteDuration(),
+    "How long a superseded schema version is kept after a newer DDL batch is "
+    "applied. Every DDL batch otherwise keeps a full copy of the schema for "
+    "the database's version_retention_period (1h by default), so applying "
+    "many batches grows memory. Unset (the default) keeps that behaviour. "
+    "0s keeps only the latest version. Reads at a timestamp older than the "
+    "oldest kept version fail with the same error as a read past the "
+    "version retention period.");
+
 namespace google {
 namespace spanner {
 namespace emulator {
@@ -74,6 +85,19 @@ int abort_current_transaction_probability() {
 
 void set_abort_current_transaction_probability(int probability) {
   absl::SetFlag(&FLAGS_abort_current_transaction_probability, probability);
+}
+
+bool schema_version_retention_set() {
+  return absl::GetFlag(FLAGS_schema_version_retention) !=
+         absl::InfiniteDuration();
+}
+
+absl::Duration schema_version_retention() {
+  return absl::GetFlag(FLAGS_schema_version_retention);
+}
+
+void set_schema_version_retention(absl::Duration retention) {
+  absl::SetFlag(&FLAGS_schema_version_retention, retention);
 }
 
 }  // namespace config

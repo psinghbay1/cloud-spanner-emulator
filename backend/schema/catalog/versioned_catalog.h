@@ -17,8 +17,10 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_SCHEMA_CATALOG_VERSIONED_CATALOG_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_SCHEMA_CATALOG_VERSIONED_CATALOG_H_
 
+#include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 
 #include "absl/base/thread_annotations.h"
 #include "absl/status/status.h"
@@ -51,6 +53,10 @@ class VersionedCatalog {
   // GetSchema never returns a nullptr.
   const Schema* GetSchema(absl::Time timestamp) const ABSL_LOCKS_EXCLUDED(mu_);
 
+  // Same lookup, but the holder keeps the version alive across a prune.
+  std::shared_ptr<const Schema> GetSchemaShared(absl::Time timestamp) const
+      ABSL_LOCKS_EXCLUDED(mu_);
+
   // Returns the latest schema object in the catalog. Will return the first
   // schema initialized if there are no subsequent new schema. Therefore,
   // GetLatestSchema never returns a nullptr.
@@ -65,12 +71,38 @@ class VersionedCatalog {
 
   void RemoveExpiredSchemas(absl::Time timestamp) ABSL_LOCKS_EXCLUDED(mu_);
 
+  // Erases every schema version created before `cutoff`, keeping the infinite
+  // past sentinel, the latest schema, and the one version that was current at
+  // `cutoff` (reads at `cutoff` still resolve). Returns the number erased.
+  // Once anything is erased, reads at timestamps older than the kept covering
+  // version can no longer be served: see MinReadableSchemaTime().
+  int64_t PruneSchemasOlderThan(absl::Time cutoff) ABSL_LOCKS_EXCLUDED(mu_);
+
+  // Creation time of the latest schema. Transactions compare this, not the
+  // Schema pointer: a pruned version's address can be reused by the next one.
+  absl::Time LatestSchemaTime() const ABSL_LOCKS_EXCLUDED(mu_);
+
+  // Earliest timestamp whose schema is still held. absl::InfinitePast() until a
+  // prune erases something; afterwards the creation time of the oldest kept
+  // non-sentinel version. A read below it would silently get a newer schema.
+  absl::Time MinReadableSchemaTime() const ABSL_LOCKS_EXCLUDED(mu_);
+
+  // Retention applied eagerly by AddSchema, independent of the database's
+  // version_retention_period. Unset (the default) keeps today's behaviour:
+  // versions are only dropped by RemoveExpiredSchemas after the retention
+  // period. absl::ZeroDuration() keeps the latest version only.
+  void set_schema_version_retention(absl::Duration retention)
+      ABSL_LOCKS_EXCLUDED(mu_);
+
   absl::Duration version_retention_period() const {
     absl::MutexLock lock(&mu_);
     return version_retention_period_;
   }
 
  private:
+  int64_t PruneSchemasOlderThanLocked(absl::Time cutoff)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
   // For guarding concurrent access to `schemas_`.
   mutable absl::Mutex mu_;
 
@@ -82,12 +114,20 @@ class VersionedCatalog {
   // Note that this cannot be changed into a hash map (e.g. std::unordered_map)
   // because the lookup of schemas by creation timestamp depends on the ordering
   // of keys in this map.
-  std::map<absl::Time, std::unique_ptr<const Schema>> schemas_
+  // shared_ptr so a transaction can pin the version it resolved: pruning
+  // erases the map entry, and the Schema is freed once no pin remains.
+  std::map<absl::Time, std::shared_ptr<const Schema>> schemas_
       ABSL_GUARDED_BY(mu_);
 
   // The retention period for schema versions.
   absl::Duration version_retention_period_ ABSL_GUARDED_BY(mu_) =
       absl::Hours(1);
+
+  // Eager retention for AddSchema; unset = follow version_retention_period_.
+  std::optional<absl::Duration> schema_version_retention_ ABSL_GUARDED_BY(mu_);
+
+  // See MinReadableSchemaTime().
+  absl::Time min_readable_time_ ABSL_GUARDED_BY(mu_) = absl::InfinitePast();
 };
 
 }  // namespace backend
